@@ -10,7 +10,8 @@ This module manages order book data, including:
 """
 
 import asyncio
-from datetime import datetime
+from collections import deque
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Optional
 
@@ -51,6 +52,11 @@ class OrderBookManager:
         # In-memory storage
         self._current_orderbooks: dict[str, OrderBook] = {}
         self._tracked_densities: dict[str, list[Density]] = {}
+
+        # Price and volume history for take-profit analysis
+        self.price_history: dict[str, deque] = {}
+        self.volume_history: dict[str, deque] = {}
+        self.history_max_points = 60  # ~30 seconds at 2 updates/sec
 
         # Background tasks
         self._snapshot_task: Optional[asyncio.Task] = None
@@ -122,6 +128,22 @@ class OrderBookManager:
                 error=str(e),
                 exc_info=True
             )
+
+        # Track price history
+        mid_price = orderbook.get_mid_price()
+        if mid_price:
+            if symbol not in self.price_history:
+                self.price_history[symbol] = deque(maxlen=self.history_max_points)
+
+            self.price_history[symbol].append((datetime.now(), mid_price))
+
+        # Track volume history
+        if symbol not in self.volume_history:
+            self.volume_history[symbol] = deque(maxlen=self.history_max_points)
+
+        bid_volume = orderbook.get_total_volume(OrderSide.BID)
+        ask_volume = orderbook.get_total_volume(OrderSide.ASK)
+        self.volume_history[symbol].append((datetime.now(), bid_volume, ask_volume))
 
     async def _process_densities(
         self, orderbook: OrderBook, params: CoinParameters
@@ -489,3 +511,55 @@ class OrderBookManager:
             List of current densities (empty list if none)
         """
         return self._tracked_densities.get(symbol, [])
+
+    def get_price_history(
+        self, symbol: str, seconds: int
+    ) -> list[tuple[datetime, Decimal]]:
+        """
+        Get price history for a symbol.
+
+        Args:
+            symbol: Trading symbol
+            seconds: Number of seconds of history to return
+
+        Returns:
+            List of (timestamp, price) tuples
+        """
+        if symbol not in self.price_history:
+            return []
+
+        cutoff_time = datetime.now() - timedelta(seconds=seconds)
+
+        history = [
+            (ts, price)
+            for ts, price in self.price_history[symbol]
+            if ts >= cutoff_time
+        ]
+
+        return history
+
+    def get_volume_history(
+        self, symbol: str, seconds: int
+    ) -> list[tuple[datetime, Decimal, Decimal]]:
+        """
+        Get volume history for a symbol.
+
+        Args:
+            symbol: Trading symbol
+            seconds: Number of seconds of history to return
+
+        Returns:
+            List of (timestamp, bid_volume, ask_volume) tuples
+        """
+        if symbol not in self.volume_history:
+            return []
+
+        cutoff_time = datetime.now() - timedelta(seconds=seconds)
+
+        history = [
+            (ts, bid_vol, ask_vol)
+            for ts, bid_vol, ask_vol in self.volume_history[symbol]
+            if ts >= cutoff_time
+        ]
+
+        return history
