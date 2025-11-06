@@ -18,13 +18,17 @@ from uuid import UUID
 import asyncpg
 from asyncpg import Pool, Record
 
+from src.utils.logger import get_logger
+
 from .models import (
     CoinParameters,
     Density,
+    ExitReason,
     MarketStats,
     OrderBook,
     OrderSide,
     Position,
+    PositionStatus,
     SystemEvent,
     Trade,
 )
@@ -151,6 +155,7 @@ class DatabaseManager:
         self.pool_size = pool_size
         self.pool: Optional[Pool] = None
         self.coin_params_cache: Optional[CoinParametersCache] = None
+        self.logger = get_logger(__name__)
 
     async def connect(self) -> None:
         """Establish connection pool to database."""
@@ -582,6 +587,149 @@ class DatabaseManager:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
+
+    async def create_trade_record(self, position: Position) -> UUID:
+        """
+        Create a trade record for an open position.
+
+        Args:
+            position: Position object to create record for
+
+        Returns:
+            UUID of created trade record from database
+        """
+        query = """
+            INSERT INTO trades (
+                symbol, entry_time, entry_price, position_size, leverage,
+                direction, signal_type, stop_loss_price, status, breakeven_moved
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            RETURNING id
+        """
+
+        trade_id = await self.fetchval(
+            query,
+            position.symbol,
+            position.entry_time,
+            position.entry_price,
+            position.size,
+            position.leverage,
+            position.direction.value,
+            position.signal_type.value,
+            position.stop_loss,
+            PositionStatus.OPEN.value,
+            False,  # breakeven_moved
+            timeout=5.0,
+        )
+
+        self.logger.info(
+            "trade_record_created",
+            trade_id=str(trade_id),
+            symbol=position.symbol,
+        )
+
+        return trade_id
+
+    async def update_trade_stop_loss(
+        self, trade_id: UUID, new_sl: Decimal, breakeven: bool
+    ) -> None:
+        """
+        Update stop-loss for a trade record.
+
+        Args:
+            trade_id: UUID of trade to update
+            new_sl: New stop-loss price
+            breakeven: Whether this is a breakeven move
+        """
+        query = """
+            UPDATE trades
+            SET stop_loss_price = $1, breakeven_moved = $2, updated_at = NOW()
+            WHERE id = $3
+        """
+
+        await self.execute(
+            query,
+            new_sl,
+            breakeven,
+            trade_id,
+            timeout=5.0,
+        )
+
+        self.logger.info(
+            "trade_stop_loss_updated",
+            trade_id=str(trade_id),
+            new_sl=float(new_sl),
+            breakeven=breakeven,
+        )
+
+    async def close_trade_record(
+        self,
+        trade_id: UUID,
+        exit_price: Decimal,
+        exit_time: datetime,
+        pnl: Decimal,
+        reason: ExitReason,
+    ) -> None:
+        """
+        Close a trade record with exit information.
+
+        Args:
+            trade_id: UUID of trade to close
+            exit_price: Price at which position was closed
+            exit_time: Timestamp of closure
+            pnl: Realized profit/loss
+            reason: Reason for exit
+        """
+        query = """
+            UPDATE trades
+            SET exit_time = $1, exit_price = $2, profit_loss = $3,
+                profit_loss_percent = (($2 - entry_price) / entry_price * 100),
+                exit_reason = $4, status = $5, updated_at = NOW()
+            WHERE id = $6
+        """
+
+        await self.execute(
+            query,
+            exit_time,
+            exit_price,
+            pnl,
+            reason.value,
+            PositionStatus.CLOSED.value,
+            trade_id,
+            timeout=5.0,
+        )
+
+        self.logger.info(
+            "trade_record_closed",
+            trade_id=str(trade_id),
+            exit_price=float(exit_price),
+            pnl=float(pnl),
+            reason=reason.value,
+        )
+
+    async def get_open_trades(self) -> list[dict]:
+        """
+        Get all open trade records from database.
+
+        Returns:
+            List of dictionaries with trade data
+        """
+        query = """
+            SELECT * FROM trades
+            WHERE status = $1
+            ORDER BY entry_time DESC
+        """
+
+        rows = await self.fetch(
+            query,
+            PositionStatus.OPEN.value,
+            timeout=10.0,
+        )
+
+        trades = [dict(row) for row in rows]
+
+        self.logger.info("open_trades_fetched", count=len(trades))
+
+        return trades
 
     # ==================== Order Book Snapshots ====================
 
