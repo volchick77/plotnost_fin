@@ -1,0 +1,86 @@
+# Trading Bot Configuration
+
+# Exchange settings
+exchange:
+  name: bybit
+  api_key_env: BYBIT_API_KEY
+  api_secret_env: BYBIT_API_SECRET
+
+# WebSocket configuration
+websocket:
+  orderbook_depth: 50
+  reconnect_delay_initial: 1
+  reconnect_delay_max: 30
+  snapshot_interval: 300  # seconds (5 minutes)
+
+# Market analysis settings
+market:
+  update_interval: 300  # seconds (5 minutes)
+  top_gainers_count: 20
+  top_losers_count: 20
+  min_24h_volume: 1000000  # USDT
+
+# Trading parameters
+trading:
+  position_size_usd: 0.1
+  leverage: 10
+  margin_mode: ISOLATED
+  max_concurrent_positions: 10
+  max_exposure_percent: 5  # percent of total balance
+
+# Strategy parameters (defaults, can be overridden per coin in DB)
+strategy:
+  # Density detection thresholds
+  density_threshold_abs: 50000  # USDT
+  density_threshold_relative: 3.0  # multiplier
+  density_threshold_percent: 5.0  # percent of total orderbook volume
+
+  # Cluster detection
+  cluster_range_percent: 0.15  # price range for clustering (0.1-0.2%)
+
+  # Breakout parameters
+  breakout_erosion_percent: 30.0  # percent of density volume eaten
+  breakout_min_stop_loss_percent: 0.1
+  breakout_breakeven_profit_percent: 0.5
+
+  # Bounce parameters
+  bounce_touch_tolerance_percent: 0.2
+  bounce_stop_loss_behind_density_percent: 0.3
+  bounce_density_erosion_exit_percent: 65.0
+  bounce_density_stable_threshold_percent: 10.0
+
+  # Take-profit parameters
+  tp_slowdown_multiplier: 3.0
+  tp_local_extrema_hours: 4
+
+  # Trend determination
+  trend_price_change_threshold: 2.0  # percent for UP/DOWN trend
+  trend_orderbook_pressure_ratio: 1.2  # bid/ask volume ratio
+
+# Safety mechanisms
+safety:
+  connection_loss_timeout: 30  # seconds before emergency close
+  emergency_close_all: true
+  require_stop_loss: true  # never open position without SL
+  max_api_retries: 5
+  api_retry_delay_initial: 1
+  api_retry_delay_max: 10
+
+# Database configuration
+database:
+  host: localhost
+  port: 5432
+  name: trading_bot
+  user_env: DB_USER
+  password_env: DB_PASSWORD
+  pool_min_size: 5
+  pool_max_size: 10
+
+# Logging configuration
+logging:
+  level: INFO  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+  file: logs/trading_bot.log
+  max_size_mb: 100
+  backup_count: 10
+  format: json  # json or text
+  console_output: true
