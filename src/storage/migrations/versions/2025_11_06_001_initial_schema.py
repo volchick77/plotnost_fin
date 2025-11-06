@@ -46,6 +46,7 @@ def upgrade() -> None:
         sa.Column('position_size', sa.DECIMAL(20, 8), nullable=False),
         sa.Column('leverage', sa.Integer, nullable=False),
         sa.Column('signal_type', sa.String(20), nullable=False),
+        sa.Column('direction', sa.String(10), nullable=False),  # LONG or SHORT
         sa.Column('profit_loss', sa.DECIMAL(20, 8), nullable=True),
         sa.Column('profit_loss_percent', sa.DECIMAL(10, 4), nullable=True),
         sa.Column('stop_loss_price', sa.DECIMAL(20, 8), nullable=False),

@@ -1,5 +1,6 @@
 """Alembic environment configuration for async migrations."""
 import asyncio
+import os
 from logging.config import fileConfig
 
 from sqlalchemy import pool
@@ -7,9 +8,23 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from alembic import context
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # this is the Alembic Config object
 config = context.config
+
+# Override sqlalchemy.url from environment variables if available
+db_user = os.getenv("DB_USER", "trading_bot")
+db_password = os.getenv("DB_PASSWORD", "password")
+db_host = os.getenv("DB_HOST", "localhost")
+db_port = os.getenv("DB_PORT", "5432")
+db_name = os.getenv("DB_NAME", "trading_bot")
+
+database_url = f"postgresql+asyncpg://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
+config.set_main_option("sqlalchemy.url", database_url)
 
 # Interpret the config file for Python logging.
 if config.config_file_name is not None:

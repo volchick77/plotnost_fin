@@ -23,6 +23,7 @@ from .models import (
     Density,
     MarketStats,
     OrderBook,
+    OrderSide,
     Position,
     SystemEvent,
     Trade,
@@ -222,46 +223,74 @@ class DatabaseManager:
         query: str,
         *args: Any,
         timeout: Optional[float] = None,
+        retry_count: int = 3,
     ) -> list[Record]:
         """
-        Fetch multiple rows.
+        Fetch multiple rows with retry logic.
 
         Args:
             query: SQL query
             *args: Query parameters
             timeout: Query timeout in seconds
+            retry_count: Number of retries on failure
 
         Returns:
             List of database records
+
+        Raises:
+            Exception: If all retries fail
         """
         if not self.pool:
             raise RuntimeError("Database not connected")
 
-        async with self.pool.acquire() as conn:
-            return await conn.fetch(query, *args, timeout=timeout)
+        last_error = None
+        for attempt in range(retry_count):
+            try:
+                async with self.pool.acquire() as conn:
+                    return await conn.fetch(query, *args, timeout=timeout)
+            except Exception as e:
+                last_error = e
+                if attempt < retry_count - 1:
+                    await asyncio.sleep(2 ** attempt)  # Exponential backoff
+
+        raise last_error  # type: ignore
 
     async def fetchrow(
         self,
         query: str,
         *args: Any,
         timeout: Optional[float] = None,
+        retry_count: int = 3,
     ) -> Optional[Record]:
         """
-        Fetch a single row.
+        Fetch a single row with retry logic.
 
         Args:
             query: SQL query
             *args: Query parameters
             timeout: Query timeout in seconds
+            retry_count: Number of retries on failure
 
         Returns:
             Database record or None
+
+        Raises:
+            Exception: If all retries fail
         """
         if not self.pool:
             raise RuntimeError("Database not connected")
 
-        async with self.pool.acquire() as conn:
-            return await conn.fetchrow(query, *args, timeout=timeout)
+        last_error = None
+        for attempt in range(retry_count):
+            try:
+                async with self.pool.acquire() as conn:
+                    return await conn.fetchrow(query, *args, timeout=timeout)
+            except Exception as e:
+                last_error = e
+                if attempt < retry_count - 1:
+                    await asyncio.sleep(2 ** attempt)  # Exponential backoff
+
+        raise last_error  # type: ignore
 
     async def fetchval(
         self,
@@ -269,24 +298,38 @@ class DatabaseManager:
         *args: Any,
         column: int = 0,
         timeout: Optional[float] = None,
+        retry_count: int = 3,
     ) -> Any:
         """
-        Fetch a single value.
+        Fetch a single value with retry logic.
 
         Args:
             query: SQL query
             *args: Query parameters
             column: Column index to return
             timeout: Query timeout in seconds
+            retry_count: Number of retries on failure
 
         Returns:
             Single value from database
+
+        Raises:
+            Exception: If all retries fail
         """
         if not self.pool:
             raise RuntimeError("Database not connected")
 
-        async with self.pool.acquire() as conn:
-            return await conn.fetchval(query, *args, column=column, timeout=timeout)
+        last_error = None
+        for attempt in range(retry_count):
+            try:
+                async with self.pool.acquire() as conn:
+                    return await conn.fetchval(query, *args, column=column, timeout=timeout)
+            except Exception as e:
+                last_error = e
+                if attempt < retry_count - 1:
+                    await asyncio.sleep(2 ** attempt)  # Exponential backoff
+
+        raise last_error  # type: ignore
 
     # ==================== Coin Parameters ====================
 
@@ -313,16 +356,16 @@ class DatabaseManager:
             density_threshold_abs=row["density_threshold_abs"],
             density_threshold_relative=row["density_threshold_relative"],
             density_threshold_percent=row["density_threshold_percent"],
-            cluster_range_percent=row.get("cluster_range_percent", Decimal("0.5")),
-            breakout_erosion_percent=row.get("breakout_erosion_percent", Decimal("30.0")),
-            breakout_min_stop_loss_percent=row.get("breakout_min_stop_loss_percent", Decimal("0.1")),
-            breakout_breakeven_profit_percent=row.get("breakout_breakeven_profit_percent", Decimal("0.5")),
-            bounce_touch_tolerance_percent=row.get("bounce_touch_tolerance_percent", Decimal("0.2")),
-            bounce_density_stable_percent=row.get("bounce_density_stable_percent", Decimal("10.0")),
-            bounce_stop_loss_behind_density_percent=row.get("bounce_stop_loss_behind_density_percent", Decimal("0.3")),
-            bounce_density_erosion_exit_percent=row.get("bounce_density_erosion_exit_percent", Decimal("65.0")),
-            tp_slowdown_multiplier=row.get("tp_slowdown_multiplier", Decimal("3.0")),
-            tp_local_extrema_hours=row.get("tp_local_extrema_hours", 4),
+            cluster_range_percent=row["cluster_range_percent"],
+            breakout_erosion_percent=row["breakout_erosion_percent"],
+            breakout_min_stop_loss_percent=row["breakout_min_stop_loss_percent"],
+            breakout_breakeven_profit_percent=row["breakout_breakeven_profit_percent"],
+            bounce_touch_tolerance_percent=row["bounce_touch_tolerance_percent"],
+            bounce_density_stable_percent=row["bounce_density_stable_percent"],
+            bounce_stop_loss_behind_density_percent=row["bounce_stop_loss_behind_density_percent"],
+            bounce_density_erosion_exit_percent=row["bounce_density_erosion_exit_percent"],
+            tp_slowdown_multiplier=row["tp_slowdown_multiplier"],
+            tp_local_extrema_hours=row["tp_local_extrema_hours"],
             preferred_strategy=row["preferred_strategy"],
             enabled=row["enabled"],
             updated_at=row["updated_at"],
@@ -343,16 +386,16 @@ class DatabaseManager:
                 density_threshold_abs=row["density_threshold_abs"],
                 density_threshold_relative=row["density_threshold_relative"],
                 density_threshold_percent=row["density_threshold_percent"],
-                cluster_range_percent=row.get("cluster_range_percent", Decimal("0.5")),
-                breakout_erosion_percent=row.get("breakout_erosion_percent", Decimal("30.0")),
-                breakout_min_stop_loss_percent=row.get("breakout_min_stop_loss_percent", Decimal("0.1")),
-                breakout_breakeven_profit_percent=row.get("breakout_breakeven_profit_percent", Decimal("0.5")),
-                bounce_touch_tolerance_percent=row.get("bounce_touch_tolerance_percent", Decimal("0.2")),
-                bounce_density_stable_percent=row.get("bounce_density_stable_percent", Decimal("10.0")),
-                bounce_stop_loss_behind_density_percent=row.get("bounce_stop_loss_behind_density_percent", Decimal("0.3")),
-                bounce_density_erosion_exit_percent=row.get("bounce_density_erosion_exit_percent", Decimal("65.0")),
-                tp_slowdown_multiplier=row.get("tp_slowdown_multiplier", Decimal("3.0")),
-                tp_local_extrema_hours=row.get("tp_local_extrema_hours", 4),
+                cluster_range_percent=row["cluster_range_percent"],
+                breakout_erosion_percent=row["breakout_erosion_percent"],
+                breakout_min_stop_loss_percent=row["breakout_min_stop_loss_percent"],
+                breakout_breakeven_profit_percent=row["breakout_breakeven_profit_percent"],
+                bounce_touch_tolerance_percent=row["bounce_touch_tolerance_percent"],
+                bounce_density_stable_percent=row["bounce_density_stable_percent"],
+                bounce_stop_loss_behind_density_percent=row["bounce_stop_loss_behind_density_percent"],
+                bounce_density_erosion_exit_percent=row["bounce_density_erosion_exit_percent"],
+                tp_slowdown_multiplier=row["tp_slowdown_multiplier"],
+                tp_local_extrema_hours=row["tp_local_extrema_hours"],
                 preferred_strategy=row["preferred_strategy"],
                 enabled=row["enabled"],
                 updated_at=row["updated_at"],
@@ -431,10 +474,10 @@ class DatabaseManager:
             """
             INSERT INTO trades (
                 id, symbol, entry_time, exit_time, entry_price, exit_price,
-                position_size, leverage, signal_type, profit_loss, profit_loss_percent,
+                position_size, leverage, signal_type, direction, profit_loss, profit_loss_percent,
                 stop_loss_price, stop_loss_triggered, exit_reason, parameters_snapshot,
                 created_at, updated_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
             ON CONFLICT (id) DO UPDATE SET
                 exit_time = EXCLUDED.exit_time,
                 exit_price = EXCLUDED.exit_price,
@@ -453,6 +496,7 @@ class DatabaseManager:
             trade.position_size,
             trade.leverage,
             trade.signal_type.value,
+            trade.direction.value,
             trade.profit_loss,
             trade.profit_loss_percent,
             trade.stop_loss_price,
@@ -527,7 +571,7 @@ class DatabaseManager:
             exit_price=row["exit_price"],
             position_size=row["position_size"],
             leverage=row["leverage"],
-            direction=PositionDirection.LONG,  # Will be inferred from parameters_snapshot
+            direction=PositionDirection(row["direction"]),
             signal_type=SignalType(row["signal_type"]),
             profit_loss=row["profit_loss"],
             profit_loss_percent=row["profit_loss_percent"],
@@ -557,8 +601,8 @@ class DatabaseManager:
             for level in orderbook.asks
         ])
 
-        total_bid_volume = orderbook.get_total_volume("bid")
-        total_ask_volume = orderbook.get_total_volume("ask")
+        total_bid_volume = orderbook.get_total_volume(OrderSide.BID)
+        total_ask_volume = orderbook.get_total_volume(OrderSide.ASK)
         mid_price = orderbook.get_mid_price()
 
         await self.execute(
