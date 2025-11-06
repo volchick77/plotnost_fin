@@ -19,10 +19,10 @@ def upgrade() -> None:
     op.add_column('trades', sa.Column('breakeven_moved', sa.Boolean(), nullable=False, server_default='false'))
 
     # Add status column
-    op.add_column('trades', sa.Column('status', sa.String(20), nullable=False, server_default='OPEN'))
+    op.add_column('trades', sa.Column('status', sa.String(20), nullable=False, server_default='open'))
 
     # Create index for fast open position queries
-    op.create_index('idx_trades_status', 'trades', ['status'], postgresql_where=sa.text("status = 'OPEN'"))
+    op.create_index('idx_trades_status', 'trades', ['status'], postgresql_where=sa.text("status = 'open'"))
 
 
 def downgrade() -> None:
