@@ -682,7 +682,10 @@ class DatabaseManager:
         query = """
             UPDATE trades
             SET exit_time = $1, exit_price = $2, profit_loss = $3,
-                profit_loss_percent = (($2 - entry_price) / entry_price * 100),
+                profit_loss_percent = CASE
+                    WHEN direction = 'SHORT' THEN ((entry_price - $2) / entry_price * 100)
+                    ELSE (($2 - entry_price) / entry_price * 100)
+                END,
                 exit_reason = $4, status = $5, updated_at = NOW()
             WHERE id = $6
         """
