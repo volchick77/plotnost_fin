@@ -49,6 +49,13 @@ class ExitReason(str, Enum):
     STOP_LOSS = "stop_loss"
     EMERGENCY = "emergency"
     DENSITY_EROSION = "density_erosion"
+
+    # Advanced take-profit reasons
+    MOMENTUM_SLOWDOWN = "momentum_slowdown"
+    COUNTER_DENSITY = "counter_density"
+    AGGRESSIVE_REVERSAL = "aggressive_reversal"
+    RETURN_TO_RANGE = "return_to_range"
+
     STOP_LOSS_FAILED = "stop_loss_failed"
     MANUAL = "manual"
     TIMEOUT = "timeout"
