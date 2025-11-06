@@ -198,6 +198,7 @@ class Signal(BaseModel):
     symbol: str = Field(..., description="Trading symbol")
     direction: PositionDirection = Field(..., description="Long or short")
     entry_price: Decimal = Field(..., description="Suggested entry price")
+    stop_loss: Decimal = Field(..., description="Stop loss price for risk management")
     density: Density = Field(..., description="The density that triggered this signal")
     priority: Decimal = Field(default=Decimal("1.0"), description="Signal priority (higher is better)")
     timestamp: datetime = Field(default_factory=datetime.now, description="When signal was generated")
