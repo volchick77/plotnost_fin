@@ -69,12 +69,269 @@ class OrderExecutor:
             api_secret=api_secret,
         )
 
+        # Rate limiting
+        self._api_semaphore = asyncio.Semaphore(20)  # Max 20 concurrent requests
+
         self.logger.info(
             "order_executor_initialized",
             testnet=testnet,
             position_size=float(position_size_usdt),
             leverage=leverage,
         )
+
+    async def _api_call_with_retry(
+        self,
+        func: callable,
+        *args,
+        is_critical: bool = False,
+        **kwargs
+    ) -> dict:
+        """
+        Execute API call with retry logic and rate limiting.
+
+        Args:
+            func: Sync function to call (from pybit client)
+            is_critical: If True, use more retries for critical operations
+            *args, **kwargs: Arguments to pass to func
+
+        Returns:
+            API response dict
+
+        Raises:
+            Exception if all retries exhausted
+        """
+        max_retries = 5 if is_critical else 3
+
+        for attempt in range(max_retries):
+            try:
+                async with self._api_semaphore:
+                    loop = asyncio.get_event_loop()
+                    response = await loop.run_in_executor(None, lambda: func(*args, **kwargs))
+
+                    # Check for rate limit error
+                    if response.get("retCode") == 10006:  # Rate limit exceeded
+                        delay = 0.5 * (2 ** attempt)  # Exponential backoff
+                        self.logger.warning(
+                            "rate_limit_hit",
+                            attempt=attempt + 1,
+                            retry_delay=delay,
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+
+                    # Check for other errors
+                    if response.get("retCode") != 0:
+                        self.logger.error(
+                            "api_call_failed",
+                            ret_code=response.get("retCode"),
+                            ret_msg=response.get("retMsg"),
+                            attempt=attempt + 1,
+                        )
+
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(1 * (attempt + 1))
+                            continue
+                        else:
+                            raise Exception(f"API call failed: {response.get('retMsg')}")
+
+                    return response
+
+            except Exception as e:
+                self.logger.error(
+                    "api_call_exception",
+                    error=str(e),
+                    attempt=attempt + 1,
+                )
+
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(1 * (attempt + 1))
+                else:
+                    raise
+
+        raise Exception("All retries exhausted")
+
+    async def get_account_balance(self) -> Decimal:
+        """
+        Get account balance in USDT from Bybit.
+
+        Returns:
+            Available USDT balance
+        """
+        try:
+            response = await self._api_call_with_retry(
+                self.client.get_wallet_balance,
+                accountType="UNIFIED",
+                coin="USDT",
+                is_critical=False,
+            )
+
+            # Parse response
+            result = response.get("result", {})
+            coins = result.get("list", [{}])[0].get("coin", [])
+
+            for coin in coins:
+                if coin.get("coin") == "USDT":
+                    balance = Decimal(coin.get("walletBalance", "0"))
+
+                    self.logger.info(
+                        "balance_fetched",
+                        balance=float(balance),
+                    )
+
+                    return balance
+
+            self.logger.warning("usdt_balance_not_found")
+            return Decimal("0")
+
+        except Exception as e:
+            self.logger.error(
+                "get_balance_failed",
+                error=str(e),
+                exc_info=True,
+            )
+            # Return 0 on error to trigger safety checks
+            return Decimal("0")
+
+    async def fetch_open_positions_from_exchange(self) -> list[dict]:
+        """
+        Fetch all open positions from Bybit exchange.
+
+        Returns:
+            List of position dictionaries
+        """
+        try:
+            response = await self._api_call_with_retry(
+                self.client.get_positions,
+                category="linear",
+                settleCoin="USDT",
+                is_critical=False,
+            )
+
+            result = response.get("result", {})
+            positions = result.get("list", [])
+
+            # Filter only positions with non-zero size
+            open_positions = [
+                pos for pos in positions
+                if Decimal(pos.get("size", "0")) > 0
+            ]
+
+            self.logger.info(
+                "positions_fetched_from_exchange",
+                count=len(open_positions),
+            )
+
+            return open_positions
+
+        except Exception as e:
+            self.logger.error(
+                "fetch_positions_failed",
+                error=str(e),
+                exc_info=True,
+            )
+            return []
+
+    async def close_position(
+        self, symbol: str, qty: Decimal, side: str
+    ) -> bool:
+        """
+        Close a position with market order.
+
+        Args:
+            symbol: Trading symbol
+            qty: Quantity to close
+            side: "Sell" for closing LONG, "Buy" for closing SHORT
+
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            response = await self._api_call_with_retry(
+                self.client.place_order,
+                category="linear",
+                symbol=symbol,
+                side=side,
+                orderType="Market",
+                qty=str(qty),
+                timeInForce="GTC",
+                reduceOnly=True,
+                positionIdx=0,
+                is_critical=True,  # Closing is critical
+            )
+
+            if response.get("retCode") == 0:
+                order_id = response.get("result", {}).get("orderId")
+                self.logger.info(
+                    "position_closed",
+                    symbol=symbol,
+                    qty=float(qty),
+                    side=side,
+                    order_id=order_id,
+                )
+                return True
+            else:
+                self.logger.error(
+                    "close_position_failed",
+                    symbol=symbol,
+                    response=response,
+                )
+                return False
+
+        except Exception as e:
+            self.logger.error(
+                "close_position_exception",
+                symbol=symbol,
+                error=str(e),
+                exc_info=True,
+            )
+            return False
+
+    async def modify_stop_loss(
+        self, symbol: str, stop_loss: Decimal
+    ) -> bool:
+        """
+        Modify stop-loss for an open position.
+
+        Args:
+            symbol: Trading symbol
+            stop_loss: New stop-loss price
+
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            response = await self._api_call_with_retry(
+                self.client.set_trading_stop,
+                category="linear",
+                symbol=symbol,
+                stopLoss=str(stop_loss),
+                positionIdx=0,
+                is_critical=True,  # SL modification is critical
+            )
+
+            if response.get("retCode") == 0:
+                self.logger.info(
+                    "stop_loss_modified",
+                    symbol=symbol,
+                    stop_loss=float(stop_loss),
+                )
+                return True
+            else:
+                self.logger.error(
+                    "modify_stop_loss_failed",
+                    symbol=symbol,
+                    response=response,
+                )
+                return False
+
+        except Exception as e:
+            self.logger.error(
+                "modify_stop_loss_exception",
+                symbol=symbol,
+                error=str(e),
+                exc_info=True,
+            )
+            return False
 
     async def execute_signal(self, signal: Signal) -> Optional[Position]:
         """
@@ -131,6 +388,10 @@ class OrderExecutor:
                 signal_priority=signal.priority,
             )
 
+            # 7. Save to database and get trade_id
+            trade_id = await self.db_manager.create_trade_record(position)
+            position.id = trade_id  # Update position with DB ID
+
             self.logger.info(
                 "position_opened",
                 symbol=signal.symbol,
@@ -139,6 +400,7 @@ class OrderExecutor:
                 qty=float(qty),
                 stop_loss=float(signal.stop_loss),
                 leverage=self.leverage,
+                trade_id=str(trade_id),
             )
 
             return position
