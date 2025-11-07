@@ -146,13 +146,14 @@ class TradingBot:
             self.logger.info("subscribing_to_active_symbols")
             await self._subscribe_to_symbols()
 
-            # 6.5. Sync positions from exchange
-            self.logger.info("syncing_positions_from_exchange")
-            await self._sync_positions_on_startup()
-
             # 7. Start WebSocket
             self.logger.info("starting_websocket")
             await self.websocket_manager.start()
+
+            # 7.5. Sync positions from exchange (after WebSocket for orderbook data)
+            self.logger.info("syncing_positions_from_exchange")
+            await asyncio.sleep(2)  # Wait for initial orderbook data to arrive
+            await self._sync_positions_on_startup()
 
             # 8. Start background tasks
             self.logger.info("starting_background_tasks")

@@ -39,6 +39,7 @@ class PositionStatus(str, Enum):
     """Status of a trading position."""
 
     OPEN = "open"
+    CLOSING = "closing"
     CLOSED = "closed"
 
 
@@ -251,6 +252,23 @@ class Position(BaseModel):
             price_diff = -price_diff
 
         return (price_diff / self.entry_price) * 100 * self.leverage
+
+    def calculate_pnl(self, current_price: Decimal) -> Decimal:
+        """
+        Calculate unrealized PnL in USDT.
+
+        Args:
+            current_price: Current market price
+
+        Returns:
+            PnL in USDT (positive = profit, negative = loss)
+        """
+        price_diff = current_price - self.entry_price
+        if self.direction == PositionDirection.SHORT:
+            price_diff = -price_diff
+
+        # PnL = price_difference * position_size * leverage
+        return price_diff * self.size * self.leverage
 
     def calculate_profit_loss(self) -> Optional[Decimal]:
         """Calculate realized profit/loss (only for closed positions)."""
