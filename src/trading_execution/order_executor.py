@@ -378,21 +378,37 @@ class OrderExecutor:
             )
 
             # 6. Save to database and get trade_id
-            trade_id = await self.db_manager.create_trade_record(position)
-            position.id = trade_id  # Update position with DB ID
+            try:
+                trade_id = await self.db_manager.create_trade_record(position)
 
-            self.logger.info(
-                "position_opened",
-                symbol=signal.symbol,
-                direction=signal.direction.value,
-                entry_price=float(position.entry_price),
-                qty=float(qty),
-                stop_loss=float(signal.stop_loss),
-                leverage=self.leverage,
-                trade_id=str(trade_id),
-            )
+                # Update position with DB ID using Pydantic model_copy for safety
+                position = position.model_copy(update={"id": trade_id})
 
-            return position
+                self.logger.info(
+                    "position_opened",
+                    symbol=signal.symbol,
+                    direction=signal.direction.value,
+                    entry_price=float(position.entry_price),
+                    qty=float(qty),
+                    stop_loss=float(signal.stop_loss),
+                    leverage=self.leverage,
+                    trade_id=str(trade_id),
+                )
+
+                return position
+
+            except Exception as e:
+                self.logger.error(
+                    "trade_record_creation_failed",
+                    symbol=signal.symbol,
+                    error=str(e),
+                    exc_info=True,
+                    message="CRITICAL: Position opened on exchange but not tracked in database"
+                )
+                # CRITICAL: Close position if we can't track it in database
+                close_side = "Sell" if signal.direction == PositionDirection.LONG else "Buy"
+                await self.close_position(signal.symbol, qty, close_side)
+                raise
 
         except Exception as e:
             self.logger.error(

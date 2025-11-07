@@ -698,7 +698,7 @@ class DatabaseManager:
             reason.value,
             PositionStatus.CLOSED.value,
             trade_id,
-            timeout=5.0,
+            timeout=10.0,  # Increased from 5.0 for complex CASE statement
         )
 
         self.logger.info(
