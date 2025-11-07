@@ -20,6 +20,7 @@ from src.storage.models import (
     PositionDirection,
     ExitReason,
     OrderSide,
+    CoinParameters,
 )
 from src.storage.db_manager import DatabaseManager
 from src.data_collection.orderbook_manager import OrderBookManager
@@ -102,7 +103,7 @@ class PositionMonitor:
         return abs(velocity)
 
     def _check_velocity_slowdown(
-        self, symbol: str, params
+        self, symbol: str, params: CoinParameters
     ) -> bool:
         """
         Check if price velocity has slowed down significantly.
@@ -217,7 +218,7 @@ class PositionMonitor:
             return False
 
     def _check_aggressive_counter_orders(
-        self, position: Position, params
+        self, position: Position, params: CoinParameters
     ) -> bool:
         """
         Check for aggressive counter orders via orderbook imbalance change.
@@ -257,14 +258,16 @@ class PositionMonitor:
             if not imbalances:
                 return False
 
-            avg_imbalance = sum(imbalances) / len(imbalances)
+            # Convert to Decimal for financial precision
+            avg_imbalance = Decimal(sum(imbalances)) / Decimal(len(imbalances))
 
             # Get threshold from params (default 2.0 = 200%)
             threshold = getattr(params, 'tp_imbalance_change_threshold', Decimal("2.0"))
 
             if position.direction == PositionDirection.LONG:
-                # Check for sudden increase in bid volume (selling pressure)
-                if current_imbalance > avg_imbalance * threshold:
+                # Check for sudden decrease in bid/ask ratio (more asks = selling pressure)
+                # LOW imbalance = more sellers trying to exit
+                if current_imbalance < avg_imbalance / threshold:
                     self.logger.info(
                         "aggressive_counter_orders_detected",
                         symbol=position.symbol,
@@ -275,8 +278,9 @@ class PositionMonitor:
                     )
                     return True
             else:
-                # Check for sudden decrease in bid volume (buying pressure)
-                if current_imbalance < avg_imbalance / threshold:
+                # Check for sudden increase in bid/ask ratio (more bids = buying pressure)
+                # HIGH imbalance = more buyers trying to enter
+                if current_imbalance > avg_imbalance * threshold:
                     self.logger.info(
                         "aggressive_counter_orders_detected",
                         symbol=position.symbol,
