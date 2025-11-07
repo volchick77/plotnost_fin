@@ -356,25 +356,14 @@ class OrderExecutor:
                 self.logger.error("quantity_calculation_failed", symbol=signal.symbol)
                 return None
 
-            # 4. Place entry order (market order)
+            # 4. Place entry order WITH stop-loss (atomically)
+            # CRITICAL: Stop-loss is set during order creation - no separate SL order needed
             entry_order = await self._place_market_order(signal, qty)
             if not entry_order:
-                self.logger.error("entry_order_failed", symbol=signal.symbol)
+                self.logger.error("entry_order_with_stop_loss_failed", symbol=signal.symbol)
                 return None
 
-            # 5. Place stop-loss order (CRITICAL)
-            stop_order = await self._place_stop_loss_order(signal, qty)
-            if not stop_order:
-                self.logger.error(
-                    "stop_loss_order_failed",
-                    symbol=signal.symbol,
-                    message="EMERGENCY: Closing position without stop-loss"
-                )
-                # CRITICAL: Close position immediately if stop-loss fails
-                await self._emergency_close_position(signal.symbol, qty, signal.direction)
-                return None
-
-            # 6. Create Position object
+            # 5. Create Position object
             position = Position(
                 symbol=signal.symbol,
                 entry_price=Decimal(str(entry_order.get("avgPrice", signal.entry_price))),
@@ -388,7 +377,7 @@ class OrderExecutor:
                 signal_priority=signal.priority,
             )
 
-            # 7. Save to database and get trade_id
+            # 6. Save to database and get trade_id
             trade_id = await self.db_manager.create_trade_record(position)
             position.id = trade_id  # Update position with DB ID
 
@@ -519,10 +508,13 @@ class OrderExecutor:
 
     async def _place_market_order(self, signal: Signal, qty: Decimal) -> Optional[Dict[str, Any]]:
         """
-        Place market entry order.
+        Place market entry order WITH stop-loss atomically.
+
+        CRITICAL: Stop-loss is set during order creation for maximum safety.
+        Position never exists without stop-loss protection.
 
         Args:
-            signal: Trading signal
+            signal: Trading signal with stop-loss price
             qty: Order quantity
 
         Returns:
@@ -544,6 +536,10 @@ class OrderExecutor:
                         side=side,
                         orderType="Market",
                         qty=str(qty),
+                        # CRITICAL: Set stop-loss atomically with position opening
+                        stopLoss=str(signal.stop_loss),
+                        slOrderType="Market",  # Stop-loss executes as market order
+                        slTriggerBy="LastPrice",  # Trigger based on last traded price
                         timeInForce="GTC",
                         positionIdx=0,  # One-way mode
                     )
@@ -551,10 +547,11 @@ class OrderExecutor:
 
                 if response["retCode"] == 0:
                     self.logger.info(
-                        "market_order_placed",
+                        "market_order_placed_with_stop_loss",
                         symbol=signal.symbol,
                         side=side,
                         qty=float(qty),
+                        stop_loss=float(signal.stop_loss),
                         order_id=response.get("result", {}).get("orderId"),
                         attempt=attempt + 1,
                     )
@@ -573,75 +570,6 @@ class OrderExecutor:
             except Exception as e:
                 self.logger.error(
                     "market_order_error",
-                    symbol=signal.symbol,
-                    error=str(e),
-                    attempt=attempt + 1,
-                )
-
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(retry_delay * (attempt + 1))
-
-        return None
-
-    async def _place_stop_loss_order(self, signal: Signal, qty: Decimal) -> Optional[Dict[str, Any]]:
-        """
-        Place stop-loss order.
-
-        CRITICAL: This must succeed or the position will be closed immediately.
-
-        Args:
-            signal: Trading signal with stop-loss price
-            qty: Order quantity
-
-        Returns:
-            Order response dict if successful, None otherwise
-        """
-        max_retries = 3
-        retry_delay = 1  # seconds
-
-        for attempt in range(max_retries):
-            try:
-                # Stop-loss side is OPPOSITE of entry
-                side = "Sell" if signal.direction == PositionDirection.LONG else "Buy"
-
-                loop = asyncio.get_event_loop()
-                response = await loop.run_in_executor(
-                    None,
-                    lambda: self.client.place_order(
-                        category="linear",
-                        symbol=signal.symbol,
-                        side=side,
-                        orderType="Market",  # Stop market order
-                        qty=str(qty),
-                        stopLoss=str(signal.stop_loss),
-                        timeInForce="GTC",
-                        positionIdx=0,
-                    )
-                )
-
-                if response["retCode"] == 0:
-                    self.logger.info(
-                        "stop_loss_order_placed",
-                        symbol=signal.symbol,
-                        stop_price=float(signal.stop_loss),
-                        qty=float(qty),
-                        attempt=attempt + 1,
-                    )
-                    return response.get("result", {})
-                else:
-                    self.logger.error(
-                        "stop_loss_order_failed",
-                        symbol=signal.symbol,
-                        response=response,
-                        attempt=attempt + 1,
-                    )
-
-                    if attempt < max_retries - 1:
-                        await asyncio.sleep(retry_delay * (attempt + 1))
-
-            except Exception as e:
-                self.logger.error(
-                    "stop_loss_order_error",
                     symbol=signal.symbol,
                     error=str(e),
                     attempt=attempt + 1,
