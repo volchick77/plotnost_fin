@@ -19,6 +19,7 @@ from src.storage.models import (
     SignalType,
     PositionDirection,
     ExitReason,
+    OrderSide,
 )
 from src.storage.db_manager import DatabaseManager
 from src.data_collection.orderbook_manager import OrderBookManager
@@ -63,6 +64,303 @@ class PositionMonitor:
             "position_monitor_initialized",
             check_interval=check_interval_seconds,
         )
+
+    def _calculate_velocity(
+        self, history: list[tuple[datetime, Decimal]], window_sec: int
+    ) -> Decimal:
+        """
+        Calculate price velocity (% change per second) for a time window.
+
+        Args:
+            history: List of (timestamp, price) tuples
+            window_sec: Time window in seconds
+
+        Returns:
+            Velocity as % change per second
+        """
+        if len(history) < 2:
+            return Decimal("0")
+
+        cutoff_time = datetime.now() - timedelta(seconds=window_sec)
+        window_data = [(ts, price) for ts, price in history if ts >= cutoff_time]
+
+        if len(window_data) < 2:
+            return Decimal("0")
+
+        # First and last price in window
+        first_price = window_data[0][1]
+        last_price = window_data[-1][1]
+        time_diff = (window_data[-1][0] - window_data[0][0]).total_seconds()
+
+        if time_diff == 0 or first_price == 0:
+            return Decimal("0")
+
+        # % change per second
+        price_change_percent = ((last_price - first_price) / first_price) * Decimal("100")
+        velocity = price_change_percent / Decimal(str(time_diff))
+
+        return abs(velocity)
+
+    def _check_velocity_slowdown(
+        self, symbol: str, params
+    ) -> bool:
+        """
+        Check if price velocity has slowed down significantly.
+
+        Condition: short_velocity < long_velocity * threshold
+
+        Args:
+            symbol: Trading symbol
+            params: CoinParameters with thresholds
+
+        Returns:
+            True if velocity slowdown detected
+        """
+        try:
+            # Get price history
+            history = self.orderbook_manager.get_price_history(symbol, seconds=20)
+
+            if len(history) < 10:
+                return False
+
+            # Calculate velocities
+            short_velocity = self._calculate_velocity(history, window_sec=3)
+            long_velocity = self._calculate_velocity(history, window_sec=15)
+
+            if long_velocity == 0:
+                return False
+
+            # Get threshold from params (default 0.5 = 50%)
+            threshold = getattr(params, 'tp_velocity_slowdown_threshold', Decimal("0.5"))
+
+            if short_velocity < long_velocity * threshold:
+                self.logger.info(
+                    "velocity_slowdown_detected",
+                    symbol=symbol,
+                    short_velocity=float(short_velocity),
+                    long_velocity=float(long_velocity),
+                    threshold=float(threshold),
+                )
+                return True
+
+            return False
+
+        except Exception as e:
+            self.logger.error(
+                "velocity_slowdown_check_error",
+                symbol=symbol,
+                error=str(e),
+                exc_info=True,
+            )
+            return False
+
+    def _check_counter_density(self, position: Position) -> bool:
+        """
+        Check if a density exists in the direction of movement.
+
+        For LONG: check for ASK density above current price
+        For SHORT: check for BID density below current price
+
+        Args:
+            position: Position to check
+
+        Returns:
+            True if counter density detected
+        """
+        try:
+            densities = self.orderbook_manager.get_current_densities(position.symbol)
+            orderbook = self.orderbook_manager.get_current_orderbook(position.symbol)
+
+            if not orderbook:
+                return False
+
+            current_price = orderbook.get_mid_price()
+            if not current_price:
+                return False
+
+            for density in densities:
+                if position.direction == PositionDirection.LONG:
+                    # Check for ASK density above price (resistance)
+                    if density.side.value == "ASK" and density.price_level > current_price:
+                        self.logger.info(
+                            "counter_density_detected",
+                            symbol=position.symbol,
+                            position_id=str(position.id),
+                            direction="LONG",
+                            density_price=float(density.price_level),
+                            current_price=float(current_price),
+                        )
+                        return True
+                else:
+                    # Check for BID density below price (support)
+                    if density.side.value == "BID" and density.price_level < current_price:
+                        self.logger.info(
+                            "counter_density_detected",
+                            symbol=position.symbol,
+                            position_id=str(position.id),
+                            direction="SHORT",
+                            density_price=float(density.price_level),
+                            current_price=float(current_price),
+                        )
+                        return True
+
+            return False
+
+        except Exception as e:
+            self.logger.error(
+                "counter_density_check_error",
+                symbol=position.symbol,
+                position_id=str(position.id),
+                error=str(e),
+                exc_info=True,
+            )
+            return False
+
+    def _check_aggressive_counter_orders(
+        self, position: Position, params
+    ) -> bool:
+        """
+        Check for aggressive counter orders via orderbook imbalance change.
+
+        Simplified version: monitors bid/ask volume imbalance changes.
+        TODO: Use publicTrade stream for more accurate detection.
+
+        Args:
+            position: Position to check
+            params: CoinParameters with thresholds
+
+        Returns:
+            True if aggressive counter orders detected
+        """
+        try:
+            orderbook = self.orderbook_manager.get_current_orderbook(position.symbol)
+            volume_history = self.orderbook_manager.get_volume_history(position.symbol, seconds=10)
+
+            if not orderbook or len(volume_history) < 5:
+                return False
+
+            current_bid = orderbook.get_total_volume(OrderSide.BID)
+            current_ask = orderbook.get_total_volume(OrderSide.ASK)
+
+            if current_ask == 0:
+                return False
+
+            # Current imbalance ratio
+            current_imbalance = current_bid / current_ask
+
+            # Calculate average imbalance from history
+            imbalances = []
+            for _, bid_vol, ask_vol in volume_history:
+                if ask_vol > 0:
+                    imbalances.append(bid_vol / ask_vol)
+
+            if not imbalances:
+                return False
+
+            avg_imbalance = sum(imbalances) / len(imbalances)
+
+            # Get threshold from params (default 2.0 = 200%)
+            threshold = getattr(params, 'tp_imbalance_change_threshold', Decimal("2.0"))
+
+            if position.direction == PositionDirection.LONG:
+                # Check for sudden increase in bid volume (selling pressure)
+                if current_imbalance > avg_imbalance * threshold:
+                    self.logger.info(
+                        "aggressive_counter_orders_detected",
+                        symbol=position.symbol,
+                        position_id=str(position.id),
+                        direction="LONG",
+                        current_imbalance=float(current_imbalance),
+                        avg_imbalance=float(avg_imbalance),
+                    )
+                    return True
+            else:
+                # Check for sudden decrease in bid volume (buying pressure)
+                if current_imbalance < avg_imbalance / threshold:
+                    self.logger.info(
+                        "aggressive_counter_orders_detected",
+                        symbol=position.symbol,
+                        position_id=str(position.id),
+                        direction="SHORT",
+                        current_imbalance=float(current_imbalance),
+                        avg_imbalance=float(avg_imbalance),
+                    )
+                    return True
+
+            return False
+
+        except Exception as e:
+            self.logger.error(
+                "aggressive_counter_orders_check_error",
+                symbol=position.symbol,
+                position_id=str(position.id),
+                error=str(e),
+                exc_info=True,
+            )
+            return False
+
+    def _check_return_to_known_levels(self, position: Position) -> bool:
+        """
+        Check if price returned to known levels (density breakout failed).
+
+        Simplified version: compares with density_price.
+        TODO: Use LocalExtremaTracker for precise local max/min tracking.
+
+        Args:
+            position: Position to check
+
+        Returns:
+            True if returned to known levels
+        """
+        try:
+            # Only check for BREAKOUT strategy
+            if position.signal_type != SignalType.BREAKOUT:
+                return False
+
+            orderbook = self.orderbook_manager.get_current_orderbook(position.symbol)
+            if not orderbook:
+                return False
+
+            current_price = orderbook.get_mid_price()
+            if not current_price:
+                return False
+
+            if position.direction == PositionDirection.LONG:
+                # Returned below breakout density
+                if current_price < position.density_price:
+                    self.logger.info(
+                        "return_to_known_levels_detected",
+                        symbol=position.symbol,
+                        position_id=str(position.id),
+                        direction="LONG",
+                        current_price=float(current_price),
+                        density_price=float(position.density_price),
+                    )
+                    return True
+            else:
+                # Returned above breakout density
+                if current_price > position.density_price:
+                    self.logger.info(
+                        "return_to_known_levels_detected",
+                        symbol=position.symbol,
+                        position_id=str(position.id),
+                        direction="SHORT",
+                        current_price=float(current_price),
+                        density_price=float(position.density_price),
+                    )
+                    return True
+
+            return False
+
+        except Exception as e:
+            self.logger.error(
+                "return_to_known_levels_check_error",
+                symbol=position.symbol,
+                position_id=str(position.id),
+                error=str(e),
+                exc_info=True,
+            )
+            return False
 
     async def start_monitoring(self, position: Position) -> None:
         """
@@ -354,9 +652,11 @@ class PositionMonitor:
         Check if position should be closed.
 
         Exit conditions:
-        1. Stop-loss hit (checked by exchange, not here)
-        2. Bounce density eroded too much (>= 65%)
-        3. Take-profit target reached (simplified: 2% profit for now)
+        1. Velocity slowdown (3s vs 15s)
+        2. Counter density detected
+        3. Aggressive counter orders (orderbook imbalance)
+        4. Return to known levels (for breakout)
+        5. Bounce density eroded (existing)
 
         Args:
             position: Position to check
@@ -367,7 +667,23 @@ class PositionMonitor:
             ExitReason if should close, None otherwise
         """
         try:
-            # Check for bounce density erosion exit
+            # NEW: Condition 1 - Velocity slowdown
+            if self._check_velocity_slowdown(position.symbol, params):
+                return ExitReason.MOMENTUM_SLOWDOWN
+
+            # NEW: Condition 2 - Counter density
+            if self._check_counter_density(position):
+                return ExitReason.COUNTER_DENSITY
+
+            # NEW: Condition 3 - Aggressive counter orders
+            if self._check_aggressive_counter_orders(position, params):
+                return ExitReason.AGGRESSIVE_REVERSAL
+
+            # NEW: Condition 4 - Return to known levels
+            if self._check_return_to_known_levels(position):
+                return ExitReason.RETURN_TO_RANGE
+
+            # EXISTING: Check for bounce density erosion exit
             if position.signal_type == SignalType.BOUNCE:
                 densities = self.orderbook_manager.get_current_densities(position.symbol)
 
@@ -403,29 +719,6 @@ class PositionMonitor:
                         density_price=float(position.density_price),
                     )
                     return ExitReason.DENSITY_EROSION
-
-            # Check for take-profit via profit threshold
-            # TODO: Implement proper momentum slowdown detection
-            # For now, using a simple profit percentage threshold
-            profit_percent = position.calculate_profit_percent(current_price)
-
-            # Simple take-profit at 2% profit for now
-            # In production, this would be more sophisticated:
-            # - Detect momentum slowdown (velocity decrease by slowdown_multiplier)
-            # - Detect local extrema (price reversal in last N hours)
-            tp_threshold = Decimal("2.0")
-
-            if profit_percent >= tp_threshold:
-                self.logger.info(
-                    "take_profit_target_reached",
-                    symbol=position.symbol,
-                    position_id=str(position.id),
-                    profit_percent=float(profit_percent),
-                    threshold=float(tp_threshold),
-                    current_price=float(current_price),
-                    entry_price=float(position.entry_price),
-                )
-                return ExitReason.TAKE_PROFIT
 
         except Exception as e:
             self.logger.error(
