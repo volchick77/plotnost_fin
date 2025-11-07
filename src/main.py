@@ -8,11 +8,13 @@ and manages the trading lifecycle.
 import asyncio
 import signal
 import sys
+from datetime import datetime
 from decimal import Decimal
 from typing import Optional
 
 from src.config import load_config, Config
 from src.storage.db_manager import DatabaseManager
+from src.storage.models import Position, PositionDirection, PositionStatus, SignalType, ExitReason
 from src.data_collection.market_stats_fetcher import MarketStatsFetcher
 from src.data_collection.orderbook_manager import OrderBookManager
 from src.data_collection.bybit_websocket import BybitWebSocketManager
@@ -144,6 +146,10 @@ class TradingBot:
             self.logger.info("subscribing_to_active_symbols")
             await self._subscribe_to_symbols()
 
+            # 6.5. Sync positions from exchange
+            self.logger.info("syncing_positions_from_exchange")
+            await self._sync_positions_on_startup()
+
             # 7. Start WebSocket
             self.logger.info("starting_websocket")
             await self.websocket_manager.start()
@@ -225,6 +231,81 @@ class TradingBot:
         except Exception as e:
             self.logger.error("symbol_subscription_error", error=str(e), exc_info=True)
 
+    async def _sync_positions_on_startup(self) -> None:
+        """
+        Synchronize positions with exchange on startup.
+
+        Restores monitoring for positions that were open when bot stopped.
+        """
+        try:
+            self.logger.info("syncing_positions_on_startup")
+
+            # 1. Get positions from exchange
+            exchange_positions = await self.order_executor.fetch_open_positions_from_exchange()
+
+            # 2. Get trade records from database
+            db_trades = await self.db_manager.get_open_trades()
+
+            # Create mapping of symbol -> trade data
+            trade_map = {trade['symbol']: trade for trade in db_trades}
+
+            # 3. Match and restore position monitoring
+            restored_count = 0
+            for pos_data in exchange_positions:
+                symbol = pos_data.get('symbol')
+
+                # Find corresponding trade in DB
+                trade = trade_map.get(symbol)
+                if not trade:
+                    self.logger.warning(
+                        "exchange_position_without_db_record",
+                        symbol=symbol,
+                        message="Position exists on exchange but not in DB. Manual intervention may be required."
+                    )
+                    continue
+
+                # Reconstruct Position object from DB and exchange data
+                position = Position(
+                    id=trade['id'],
+                    symbol=symbol,
+                    entry_price=Decimal(str(trade['entry_price'])),
+                    entry_time=trade['entry_time'],
+                    size=Decimal(str(pos_data.get('size', '0'))),
+                    leverage=trade['leverage'],
+                    direction=PositionDirection(trade['direction']),
+                    signal_type=SignalType(trade['signal_type']),
+                    stop_loss=Decimal(str(trade['stop_loss_price'])),
+                    status=PositionStatus.OPEN,
+                    density_price=Decimal(str(pos_data.get('avgPrice', trade['entry_price']))),
+                    signal_priority=Decimal("1.0"),
+                    breakeven_moved=trade.get('breakeven_moved', False),
+                )
+
+                # Start monitoring
+                await self.position_monitor.start_monitoring(position)
+                restored_count += 1
+
+                self.logger.info(
+                    "position_restored",
+                    symbol=symbol,
+                    position_id=str(position.id),
+                    entry_price=float(position.entry_price),
+                )
+
+            self.logger.info(
+                "position_sync_complete",
+                exchange_positions=len(exchange_positions),
+                db_trades=len(db_trades),
+                restored=restored_count,
+            )
+
+        except Exception as e:
+            self.logger.error(
+                "position_sync_error",
+                error=str(e),
+                exc_info=True,
+            )
+
     async def _signal_generation_loop(self):
         """Generate and process trading signals."""
         self.logger.info("signal_generation_loop_started")
@@ -246,9 +327,8 @@ class TradingBot:
                         signals = await self.signal_generator.generate_signals(symbol)
 
                         for signal in signals:
-                            # Validate signal
-                            # TODO: Get real balance from exchange API
-                            balance = Decimal("100")
+                            # CHANGED: Get real balance from exchange
+                            balance = await self.order_executor.get_account_balance()
                             is_valid, reason = await self.signal_validator.validate_signal(signal, balance)
 
                             if not is_valid:
@@ -290,29 +370,125 @@ class TradingBot:
 
         while self._running:
             try:
-                await asyncio.sleep(5)  # Check every 5 seconds
+                await asyncio.sleep(1)  # CHANGED: Check every 1 second for real-time TP
 
+                # Get all monitored positions
+                monitored_positions = self.position_monitor.get_monitored_positions()
+
+                for position in monitored_positions:
+                    try:
+                        # Check if breakeven move is needed
+                        if not position.breakeven_moved:
+                            orderbook = self.orderbook_manager.get_current_orderbook(position.symbol)
+                            if orderbook:
+                                current_price = orderbook.get_mid_price()
+                                if current_price:
+                                    profit_percent = position.calculate_profit_percent(current_price)
+                                    params = self.db_manager.coin_params_cache.get_sync(position.symbol)
+
+                                    if params:
+                                        # Check breakeven condition based on strategy
+                                        should_move = False
+                                        if position.signal_type == SignalType.BREAKOUT:
+                                            if profit_percent >= params.breakout_breakeven_profit_percent:
+                                                should_move = True
+                                        elif position.signal_type == SignalType.BOUNCE:
+                                            # For bounce, check density erosion
+                                            densities = self.orderbook_manager.get_current_densities(position.symbol)
+                                            for d in densities:
+                                                if d.price_level == position.density_price:
+                                                    if d.erosion_percent() >= params.bounce_density_erosion_exit_percent:
+                                                        should_move = True
+                                                    break
+
+                                        if should_move:
+                                            # Move SL to breakeven on exchange
+                                            success = await self.order_executor.modify_stop_loss(
+                                                position.symbol,
+                                                position.entry_price
+                                            )
+
+                                            if success:
+                                                # Update in memory
+                                                position.stop_loss = position.entry_price
+                                                position.breakeven_moved = True
+
+                                                # Update in database
+                                                await self.db_manager.update_trade_stop_loss(
+                                                    position.id,
+                                                    position.entry_price,
+                                                    breakeven=True
+                                                )
+
+                                                self.logger.info(
+                                                    "stop_loss_moved_to_breakeven",
+                                                    symbol=position.symbol,
+                                                    position_id=str(position.id),
+                                                    entry_price=float(position.entry_price),
+                                                )
+
+                    except Exception as e:
+                        self.logger.error(
+                            "breakeven_check_error",
+                            symbol=position.symbol,
+                            error=str(e),
+                            exc_info=True,
+                        )
+
+                # Now check for positions to close
                 positions_to_close = await self.position_monitor.check_positions()
 
                 for position in positions_to_close:
                     try:
-                        # TODO: Close position via order_executor
-                        # await self.order_executor.close_position(position)
+                        # Get current price for PnL calculation
+                        orderbook = self.orderbook_manager.get_current_orderbook(position.symbol)
+                        current_price = orderbook.get_mid_price() if orderbook else position.entry_price
 
-                        await self.position_monitor.stop_monitoring(position.symbol)
-                        self.logger.info(
-                            "position_closed",
-                            symbol=position.symbol,
-                            position_id=str(position.id),
-                            reason=position.exit_reason,
-                            pnl=float(position.realized_pnl) if position.realized_pnl else None,
+                        # CHANGED: Actually close position via API
+                        close_side = "Sell" if position.direction == PositionDirection.LONG else "Buy"
+                        success = await self.order_executor.close_position(
+                            position.symbol,
+                            position.size,
+                            close_side
                         )
+
+                        if success:
+                            # Calculate PnL
+                            pnl = position.calculate_pnl(current_price)
+
+                            # Update database
+                            await self.db_manager.close_trade_record(
+                                position.id,
+                                exit_price=current_price,
+                                exit_time=datetime.now(),
+                                pnl=pnl,
+                                reason=position.exit_reason or ExitReason.TAKE_PROFIT,
+                            )
+
+                            # Stop monitoring
+                            await self.position_monitor.stop_monitoring(position.symbol)
+
+                            self.logger.info(
+                                "position_closed",
+                                symbol=position.symbol,
+                                position_id=str(position.id),
+                                reason=position.exit_reason.value if position.exit_reason else "unknown",
+                                pnl=float(pnl),
+                                exit_price=float(current_price),
+                            )
+                        else:
+                            self.logger.error(
+                                "position_close_failed",
+                                symbol=position.symbol,
+                                position_id=str(position.id),
+                                message="Will retry on next check",
+                            )
 
                     except Exception as e:
                         self.logger.error(
                             "position_close_error",
                             symbol=position.symbol,
-                            position_id=str(position.id),
+                            position_id=str(position.id) if hasattr(position, 'id') else 'unknown',
                             error=str(e),
                             exc_info=True,
                         )
@@ -333,6 +509,11 @@ class TradingBot:
             try:
                 await asyncio.sleep(30)  # Check every 30 seconds
 
+                # CHANGED: Get real balance
+                balance = await self.order_executor.get_account_balance()
+
+                # Pass balance to safety monitor
+                # Note: safety_monitor.check_safety_conditions needs update to accept balance
                 safety_ok = await self.safety_monitor.check_safety_conditions()
 
                 if not safety_ok:
