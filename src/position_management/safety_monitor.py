@@ -78,74 +78,54 @@ class SafetyMonitor:
             max_position_exposure_percent=float(max_position_exposure_percent),
         )
 
-    async def check_safety_conditions(self) -> bool:
+    async def check_safety_conditions(self, balance: Optional[Decimal] = None) -> bool:
         """
         Check all safety conditions.
 
-        Performs comprehensive safety checks:
-        1. Account balance above minimum threshold
-        2. Position exposure within limits
-        3. Database connection health
+        Args:
+            balance: Optional current account balance
 
         Returns:
-            True if all safe, False if issues found
+            True if all conditions pass, False otherwise
         """
         try:
-            # 1. Check account balance
-            balance_ok = await self._check_account_balance()
+            # Check 1: Account balance
+            balance_ok = await self._check_account_balance(balance)
             if not balance_ok:
-                self._consecutive_failures += 1
                 return False
 
-            # 2. Check exposure limits
-            exposure_ok = await self._check_exposure_limits()
+            # Check 2: Exposure limits
+            # Use the balance for exposure calculations
+            if balance is None:
+                balance = await self.order_executor.get_account_balance()
+
+            exposure_ok = await self._check_exposure_limits(balance)
             if not exposure_ok:
-                self._consecutive_failures += 1
                 return False
 
-            # 3. Check connection health
+            # Check 3: Connection health
             health_ok = await self._check_connection_health()
-            if not health_ok:
-                self.logger.warning("connection_health_issues")
-                self._consecutive_failures += 1
-            else:
-                # Reset failure counter on success
-                self._consecutive_failures = 0
 
-            # Check if too many consecutive failures
-            if self._consecutive_failures >= self._max_consecutive_failures:
-                self.logger.critical(
-                    "too_many_consecutive_failures",
-                    consecutive_failures=self._consecutive_failures,
-                    max_allowed=self._max_consecutive_failures,
-                )
-                await self._log_critical_event(
-                    "REPEATED_SAFETY_FAILURES",
-                    f"Safety checks failed {self._consecutive_failures} times consecutively"
-                )
-                await self.disable_trading()
-                return False
-
-            return True
+            return health_ok
 
         except Exception as e:
-            self.logger.error("safety_check_failed", error=str(e), exc_info=True)
-            self._consecutive_failures += 1
+            self.logger.error("safety_check_error", error=str(e), exc_info=True)
             return False
 
-    async def _check_account_balance(self) -> bool:
+    async def _check_account_balance(self, balance: Optional[Decimal] = None) -> bool:
         """
-        Check account balance is above minimum.
+        Check if account balance is sufficient.
+
+        Args:
+            balance: Current account balance (if None, fetches from executor)
 
         Returns:
-            True if balance is safe, False if below minimum
+            True if balance is sufficient, False otherwise
         """
         try:
-            # TODO: Get real balance from exchange API
-            # For now, use placeholder
-            # In production, this would call:
-            # balance = await self.order_executor.client.get_wallet_balance()
-            balance = Decimal("100")
+            # Use provided balance or fetch from executor
+            if balance is None:
+                balance = await self.order_executor.get_account_balance()
 
             self._last_balance_check = datetime.now()
 
@@ -177,22 +157,18 @@ class SafetyMonitor:
             self.logger.error("balance_check_error", error=str(e), exc_info=True)
             return False
 
-    async def _check_exposure_limits(self) -> bool:
+    async def _check_exposure_limits(self, balance: Decimal) -> bool:
         """
-        Check total and per-position exposure limits.
+        Check if exposure limits are within acceptable range.
 
-        Verifies:
-        - Total exposure doesn't exceed max_total_exposure_percent
-        - Individual positions don't exceed max_position_exposure_percent
+        Args:
+            balance: Current account balance
 
         Returns:
-            True if exposure is within limits, False if exceeded
+            True if within limits, False otherwise
         """
         try:
-            # TODO: Get real positions and balance from exchange
-            # For now, use placeholder
-            balance = Decimal("100")
-
+            # Calculate total exposure from open positions
             # In production, this would query open positions:
             # positions = await self._get_open_positions()
             # total_exposure = sum(pos.size * pos.entry_price for pos in positions)
