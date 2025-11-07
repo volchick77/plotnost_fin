@@ -49,7 +49,24 @@ strategy:
   bounce_density_erosion_exit_percent: 65.0
   bounce_density_stable_threshold_percent: 10.0
 
-  # Take-profit parameters
+  # Take-profit (advanced)
+  take_profit:
+    # Velocity slowdown threshold (0.5 = 50% velocity drop)
+    velocity_slowdown_threshold: 0.5
+
+    # Orderbook imbalance change threshold (2.0 = 200% increase)
+    imbalance_change_threshold: 2.0
+
+    # Short velocity window in seconds
+    velocity_short_window_sec: 3
+
+    # Long velocity window in seconds
+    velocity_long_window_sec: 15
+
+    # Volume history window for imbalance calculation
+    volume_history_window_sec: 10
+
+  # Legacy take-profit parameters (deprecated but kept for backward compatibility)
   tp_slowdown_multiplier: 3.0
   tp_local_extrema_hours: 4
 
