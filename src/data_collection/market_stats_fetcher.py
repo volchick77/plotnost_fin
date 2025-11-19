@@ -307,20 +307,12 @@ class MarketStatsFetcher:
             # Don't re-raise - we want the loop to continue
 
     async def _update_loop(self) -> None:
-        """
-        Background task that periodically updates market statistics.
-
-        Runs update_market_stats() every update_interval seconds.
-        """
+        """Background task that periodically updates market statistics."""
         logger.info("market_stats_update_loop_started", interval=self.update_interval)
 
-        # Run initial update immediately
-        try:
-            await self.update_market_stats()
-        except Exception as e:
-            logger.error("initial_update_failed", error=str(e))
+        # Note: Initial update already completed in start() method (line 80)
+        # This loop handles only periodic updates
 
-        # Continue with periodic updates
         while self._running:
             try:
                 await asyncio.sleep(self.update_interval)

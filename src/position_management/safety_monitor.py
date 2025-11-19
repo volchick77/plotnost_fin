@@ -228,6 +228,17 @@ class SafetyMonitor:
                     symbol=symbol, qty=size, side=close_side
                 )
                 if success:
+                    # Log if this succeeded after retry attempts
+                    if attempt > 0:
+                        self.logger.warning(
+                            "position_close_succeeded_after_retry",
+                            symbol=symbol,
+                            size=float(size),
+                            side=close_side,
+                            attempt=attempt + 1,
+                            total_attempts=max_retries,
+                            message=f"Position closed successfully on attempt {attempt + 1} of {max_retries}"
+                        )
                     return True, None
 
                 # Failed but no exception - retry
@@ -306,13 +317,36 @@ class SafetyMonitor:
                         )
                         await asyncio.sleep(backoff_time)
 
-            if exchange_positions is None:
-                raise RuntimeError("Failed to fetch exchange positions - unexpected state")
+            # Type guard: exchange_positions is guaranteed non-None at this point because:
+            # - Line 294 assigns value on success, then breaks out of retry loop
+            # - Line 305 raises RuntimeError if all 5 retry attempts fail
+            # This assertion documents the invariant and helps static type checkers
+            assert exchange_positions is not None, (
+                "Unreachable: retry loop guarantees either successful fetch or RuntimeError. "
+                "If this assertion fails, the retry logic was modified incorrectly."
+            )
 
             self.logger.critical(
                 "emergency_closing_positions",
                 position_count=len(exchange_positions),
             )
+
+            # Validate that positions exist - empty list during capital loss emergency is ANOMALY
+            if len(exchange_positions) == 0:
+                self.logger.critical(
+                    "emergency_shutdown_no_positions_anomaly",
+                    message="ANOMALY DETECTED: Emergency shutdown triggered by capital loss but no open positions found on exchange. "
+                           "This indicates possible unauthorized activity, data corruption, or positions closed externally."
+                )
+                await self._log_critical_event(
+                    "EMERGENCY_NO_POSITIONS_ANOMALY",
+                    "Emergency shutdown triggered by capital loss (10%) but no positions found on exchange"
+                )
+                raise RuntimeError(
+                    "ANOMALY: Emergency shutdown triggered by capital loss but no open positions found on exchange. "
+                    "Possible causes: unauthorized activity, manual position closure, or DB-exchange mismatch. "
+                    "MANUAL INVESTIGATION REQUIRED."
+                )
 
             # Close all positions in parallel using asyncio.gather
             if exchange_positions:
@@ -388,24 +422,31 @@ class SafetyMonitor:
                                 error=error_message,
                             )
 
-            # Log final results
+            # Log final results to database
             await self._log_critical_event(
                 "EMERGENCY_POSITIONS_CLOSED",
                 f"Closed {closed_count} positions, failed {failed_count}"
             )
 
-            self.logger.critical(
-                "emergency_shutdown_complete",
-                closed_positions=closed_count,
-                failed_positions=failed_count,
-                message="All trading stopped. Manual verification recommended."
-            )
-
-            # Raise error if any positions failed to close
+            # Conditional logging based on outcome
             if failed_count > 0:
+                # Partial failure - some positions failed to close
+                self.logger.critical(
+                    "emergency_shutdown_partial_failure",
+                    closed_positions=closed_count,
+                    failed_positions=failed_count,
+                    message="PARTIAL FAILURE: Some positions failed to close. MANUAL INTERVENTION REQUIRED."
+                )
                 error_details = "; ".join(failed_positions)
                 raise RuntimeError(
                     f"Emergency shutdown completed but {failed_count} position(s) failed to close: {error_details}"
+                )
+            else:
+                # Complete success - all positions closed
+                self.logger.critical(
+                    "emergency_shutdown_complete",
+                    closed_positions=closed_count,
+                    message="All trading stopped successfully. Manual verification recommended."
                 )
 
         except Exception as e:
