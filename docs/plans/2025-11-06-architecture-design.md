@@ -1,5 +1,7 @@
 # Архитектура и дизайн торгового бота
 
+> **Note**: This document was created during initial design. Some implementation details may differ from the final code. For latest implementation, refer to the source code.
+
 **Дата:** 2025-11-06
 **Версия:** 1.0
 **Проект:** Автоматизированный торговый бот для фьючерсов
@@ -898,11 +900,11 @@ plotnost_fin/
 │   ├── main.py                   # Точка входа
 │   ├── config.py                 # Загрузка конфигурации
 │   │
-│   ├── data_collectors/
+│   ├── data_collection/
 │   │   ├── __init__.py
-│   │   ├── bybit_collector.py    # WebSocket менеджер
+│   │   ├── bybit_websocket.py    # WebSocket менеджер
 │   │   ├── orderbook_manager.py  # Управление состоянием orderbook
-│   │   └── market_stats.py       # Получение статистики
+│   │   └── market_stats_fetcher.py       # Получение статистики
 │   │
 │   ├── analyzers/
 │   │   ├── __init__.py

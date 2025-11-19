@@ -117,10 +117,29 @@ Per-coin parameters are stored in the database (`coin_parameters` table) and can
 ## Safety Features
 
 - **Isolated Margin**: Each position is isolated to prevent cascade liquidations
-- **Emergency Close**: Automatically closes all positions if connection lost > 30 seconds
+- **Emergency Shutdown**: Automatically closes ALL positions with market orders if capital loss exceeds 10%
+  - Parallel position closing with retry logic (3 attempts per position)
+  - Exponential backoff for resilience
+  - Anomaly detection for unauthorized activity
 - **Stop-Loss Guarantee**: Never opens a position without setting stop-loss
-- **Multi-level Validation**: Validates balance, limits, and parameters before each trade
+- **Risk Validation**: Before each trade validates:
+  - Total exposure (sum of positions < 80% of balance)
+  - Market impact (order < 1% of 24h volume)
+  - Sufficient balance
+  - Maximum concurrent positions
+- **Position Sync**: Restores monitoring for open positions after bot restart
 - **Comprehensive Logging**: All critical events logged with structured JSON format
+
+## Take-Profit System
+
+Advanced 4-condition take-profit for optimal exits:
+
+1. **Velocity Slowdown**: Price movement slows significantly (50% drop)
+2. **Counter Density**: New density appears in opposite direction
+3. **Aggressive Counter Orders**: Sudden spike in opposite-direction volume (imbalance change > 200%)
+4. **Return to Known Levels**: Price returns to previously seen range
+
+Exit triggers when ANY condition is met after breakeven is achieved.
 
 ## Monitoring
 
@@ -157,12 +176,15 @@ Main tables:
 ## Development Status
 
 - [x] Design and architecture
-- [ ] Infrastructure (Storage, Config, Logging)
-- [ ] Data Collection (WebSocket, Order Book)
-- [ ] Market Analysis (Density detection, Signals)
-- [ ] Trading Execution
-- [ ] Position Monitoring
-- [ ] Integration and Testing
+- [x] Infrastructure (Storage, Config, Logging)
+- [x] Data Collection (WebSocket, Order Book)
+- [x] Market Analysis (Density detection, Signals)
+- [x] Trading Execution (Real API integration)
+- [x] Position Monitoring (4-condition take-profit)
+- [x] Safety Mechanisms (Emergency shutdown, Risk validation)
+- [x] Integration and Testing
+
+**Current version**: Production-ready with real Bybit API integration.
 
 ## Roadmap
 
