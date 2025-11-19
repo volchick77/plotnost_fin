@@ -5,8 +5,9 @@ This module provides the SafetyMonitor class that monitors system health
 and enforces safety limits to protect against catastrophic losses.
 """
 
+import asyncio
 from decimal import Decimal
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from datetime import datetime, timedelta
 
 from src.storage.db_manager import DatabaseManager
@@ -206,6 +207,39 @@ class SafetyMonitor:
             )
             return False
 
+    async def _close_position_with_retry(
+        self, symbol: str, size: Decimal, close_side: str, max_retries: int = 3
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Close position with retry logic.
+
+        Args:
+            symbol: Trading symbol
+            size: Position size to close
+            close_side: Side to close position ("Buy" or "Sell")
+            max_retries: Maximum number of retry attempts (default: 3)
+
+        Returns:
+            Tuple of (success: bool, error_message: Optional[str])
+        """
+        for attempt in range(max_retries):
+            try:
+                success = await self.order_executor.close_position(
+                    symbol=symbol, qty=size, side=close_side
+                )
+                if success:
+                    return True, None
+
+                # Failed but no exception - retry
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(0.5 * (2 ** attempt))
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    return False, str(e)
+                await asyncio.sleep(0.5 * (2 ** attempt))
+
+        return False, "Max retries exceeded"
+
     async def emergency_shutdown(self) -> None:
         """
         Execute emergency shutdown procedures with forced position closing.
@@ -238,15 +272,52 @@ class SafetyMonitor:
             # CRITICAL: Close ALL open positions
             closed_count = 0
             failed_count = 0
+            failed_positions = []
 
-            # Fetch all open positions from exchange
-            try:
-                exchange_positions = await self.order_executor.fetch_open_positions_from_exchange()
+            # Fetch all open positions from exchange with retry logic (5 attempts)
+            exchange_positions = None
+            fetch_max_retries = 5
 
-                self.logger.critical(
-                    "emergency_closing_positions",
-                    position_count=len(exchange_positions),
-                )
+            for fetch_attempt in range(fetch_max_retries):
+                try:
+                    exchange_positions = await self.order_executor.fetch_open_positions_from_exchange()
+                    break  # Success - exit retry loop
+                except Exception as e:
+                    if fetch_attempt == fetch_max_retries - 1:
+                        # All retries failed
+                        self.logger.critical(
+                            "emergency_fetch_positions_failed_all_retries",
+                            error=str(e),
+                            exc_info=True,
+                            message="MANUAL INTERVENTION REQUIRED - Could not fetch positions after all retries"
+                        )
+                        raise RuntimeError(
+                            f"Failed to fetch open positions after {fetch_max_retries} attempts: {str(e)}"
+                        )
+                    else:
+                        # Retry with exponential backoff
+                        backoff_time = 0.5 * (2 ** fetch_attempt)
+                        self.logger.warning(
+                            "emergency_fetch_positions_retry",
+                            attempt=fetch_attempt + 1,
+                            max_retries=fetch_max_retries,
+                            backoff_seconds=backoff_time,
+                            error=str(e)
+                        )
+                        await asyncio.sleep(backoff_time)
+
+            if exchange_positions is None:
+                raise RuntimeError("Failed to fetch exchange positions - unexpected state")
+
+            self.logger.critical(
+                "emergency_closing_positions",
+                position_count=len(exchange_positions),
+            )
+
+            # Close all positions in parallel using asyncio.gather
+            if exchange_positions:
+                close_tasks = []
+                position_details = []
 
                 for pos_data in exchange_positions:
                     symbol = pos_data.get('symbol', '')
@@ -259,13 +330,45 @@ class SafetyMonitor:
                     # Determine close side (opposite of position side)
                     close_side = "Sell" if side == "Buy" else "Buy"
 
-                    try:
-                        success = await self.order_executor.close_position(
-                            symbol=symbol,
-                            qty=size,
-                            side=close_side
-                        )
+                    # Store position details for result processing
+                    position_details.append({
+                        'symbol': symbol,
+                        'size': size,
+                        'side': side,
+                        'close_side': close_side
+                    })
 
+                    # Create close task with retry logic
+                    close_tasks.append(
+                        self._close_position_with_retry(symbol, size, close_side, max_retries=3)
+                    )
+
+                # Execute all close operations in parallel
+                results = await asyncio.gather(*close_tasks, return_exceptions=True)
+
+                # Process results
+                for idx, result in enumerate(results):
+                    pos_detail = position_details[idx]
+                    symbol = pos_detail['symbol']
+                    size = pos_detail['size']
+                    close_side = pos_detail['close_side']
+
+                    if isinstance(result, Exception):
+                        # Unexpected exception from gather
+                        failed_count += 1
+                        error_msg = str(result)
+                        failed_positions.append(f"{symbol} ({size}): {error_msg}")
+                        self.logger.critical(
+                            "emergency_position_close_error",
+                            symbol=symbol,
+                            size=float(size),
+                            side=close_side,
+                            error=error_msg,
+                            exc_info=True,
+                        )
+                    else:
+                        # Result is (success, error_message) tuple
+                        success, error_message = result
                         if success:
                             closed_count += 1
                             self.logger.critical(
@@ -276,35 +379,20 @@ class SafetyMonitor:
                             )
                         else:
                             failed_count += 1
+                            failed_positions.append(f"{symbol} ({size}): {error_message}")
                             self.logger.critical(
                                 "emergency_position_close_failed",
                                 symbol=symbol,
                                 size=float(size),
                                 side=close_side,
+                                error=error_message,
                             )
 
-                    except Exception as e:
-                        failed_count += 1
-                        self.logger.critical(
-                            "emergency_position_close_error",
-                            symbol=symbol,
-                            error=str(e),
-                            exc_info=True,
-                        )
-
-                # Log final results
-                await self._log_critical_event(
-                    "EMERGENCY_POSITIONS_CLOSED",
-                    f"Closed {closed_count} positions, failed {failed_count}"
-                )
-
-            except Exception as e:
-                self.logger.critical(
-                    "emergency_fetch_positions_failed",
-                    error=str(e),
-                    exc_info=True,
-                    message="MANUAL INTERVENTION REQUIRED - Could not fetch positions"
-                )
+            # Log final results
+            await self._log_critical_event(
+                "EMERGENCY_POSITIONS_CLOSED",
+                f"Closed {closed_count} positions, failed {failed_count}"
+            )
 
             self.logger.critical(
                 "emergency_shutdown_complete",
@@ -313,6 +401,13 @@ class SafetyMonitor:
                 message="All trading stopped. Manual verification recommended."
             )
 
+            # Raise error if any positions failed to close
+            if failed_count > 0:
+                error_details = "; ".join(failed_positions)
+                raise RuntimeError(
+                    f"Emergency shutdown completed but {failed_count} position(s) failed to close: {error_details}"
+                )
+
         except Exception as e:
             self.logger.critical(
                 "emergency_shutdown_failed",
@@ -320,6 +415,7 @@ class SafetyMonitor:
                 message="MANUAL INTERVENTION REQUIRED",
                 exc_info=True,
             )
+            raise
 
     async def disable_trading(self) -> None:
         """

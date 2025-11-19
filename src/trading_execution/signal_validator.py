@@ -334,7 +334,7 @@ class SignalValidator:
         try:
             row = await self.db_manager.fetchrow(
                 "SELECT COUNT(*) as count FROM trades WHERE status = $1",
-                'open'
+                PositionStatus.OPEN.value
             )
             return row["count"] if row else 0
         except Exception as e:
@@ -359,7 +359,7 @@ class SignalValidator:
             row = await self.db_manager.fetchrow(
                 "SELECT COUNT(*) as count FROM trades WHERE symbol = $1 AND status = $2",
                 symbol,
-                'open'
+                PositionStatus.OPEN.value
             )
             return (row["count"] if row else 0) > 0
         except Exception as e:

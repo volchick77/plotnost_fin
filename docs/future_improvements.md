@@ -105,6 +105,36 @@ This document outlines enhancements that would improve the trading bot's perform
 
 ---
 
+## 6. Persistent Initial Balance for Auto-Restart Mode
+
+**Current Implementation:** `SafetyMonitor` initializes `initial_balance` on startup from current account balance. On bot restart, `initial_balance` resets to the new current balance.
+
+**Behavior:**
+- First run: `initial_balance = 1000 USDT` (fetched from exchange)
+- Loss of 10% triggers emergency shutdown: `balance = 900 USDT`
+- Manual bot restart: `initial_balance = 900 USDT` (resets)
+- Another 10% loss triggers at: `balance = 810 USDT`
+
+**Design Decision:** Current behavior is **intentional for manual restart mode**. Operator intervention between restarts implies acknowledgment of losses and conscious decision to continue trading from new baseline.
+
+**Limitation:** Not suitable for automatic restart scenarios (e.g., crash recovery, connection failures) where the 10% loss limit should persist across restarts.
+
+**Improvement:**
+- Add `auto_restart_mode` configuration flag
+- When enabled, persist `initial_balance` to database on first startup
+- Load persisted value on subsequent restarts
+- 10% loss limit applies to original capital across all restarts
+- Manual reset command to set new baseline after deliberate capital adjustments
+
+**Implementation Effort:** Low
+- Database schema: Add `system_state` table with `initial_balance` field
+- Modify: `SafetyMonitor.__init__()` to check for persisted value
+- Add: Admin command to reset baseline
+
+**Priority:** Medium (important for production reliability, but manual mode sufficient for initial deployment)
+
+---
+
 ## Implementation Roadmap
 
 **Phase 1 (Current):** Production-ready baseline

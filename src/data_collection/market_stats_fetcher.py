@@ -75,7 +75,12 @@ class MarketStatsFetcher:
             connector=aiohttp.TCPConnector(limit=10),
         )
 
-        # Start background update loop
+        # Block until initial data is loaded
+        logger.info("fetching_initial_market_stats")
+        await self.update_market_stats()
+        logger.info("initial_market_stats_loaded")
+
+        # Then start background loop for periodic updates
         self._update_task = asyncio.create_task(self._update_loop())
         logger.info("market_stats_fetcher_started")
 
