@@ -22,11 +22,12 @@ market:
 
 # Trading parameters
 trading:
-  position_size_usd: 0.1
+  position_size_usd: 0.1  # For testing, will be percentage of capital later
   leverage: 10
   margin_mode: ISOLATED
   max_concurrent_positions: 10
-  max_exposure_percent: 5  # percent of total balance
+  max_exposure_percent: 80  # Maximum sum of all positions as % of balance
+  max_volume_impact_percent: 1  # Maximum order value as % of 24h volume
 
 # Strategy parameters (defaults, can be overridden per coin in DB)
 strategy:

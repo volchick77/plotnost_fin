@@ -115,6 +115,11 @@ class TradingBot:
             self.signal_validator = SignalValidator(
                 db_manager=self.db_manager,
                 orderbook_manager=self.orderbook_manager,
+                max_concurrent_positions=self.config.trading.max_concurrent_positions,
+                max_exposure_percent=Decimal(str(self.config.trading.max_exposure_percent)),
+                max_volume_impact_percent=Decimal(str(getattr(self.config.trading, 'max_volume_impact_percent', 1))),
+                position_size_usdt=Decimal(str(self.config.trading.position_size_usd)),
+                leverage=self.config.trading.leverage,
             )
 
             self.order_executor = OrderExecutor(

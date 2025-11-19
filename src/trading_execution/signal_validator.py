@@ -41,7 +41,10 @@ class SignalValidator:
         db_manager: DatabaseManager,
         orderbook_manager: OrderBookManager,
         max_concurrent_positions: int = DEFAULT_MAX_CONCURRENT_POSITIONS,
-        max_exposure_percent: Decimal = Decimal(str(DEFAULT_MAX_EXPOSURE_PERCENT)),
+        max_exposure_percent: Decimal = Decimal("80"),
+        max_volume_impact_percent: Decimal = Decimal("1"),
+        position_size_usdt: Decimal = Decimal("0.1"),
+        leverage: int = 10,
         signal_max_age_seconds: int = 60,
     ):
         """
@@ -51,13 +54,19 @@ class SignalValidator:
             db_manager: Database manager for querying symbols and positions
             orderbook_manager: OrderBook manager for market data
             max_concurrent_positions: Maximum number of concurrent open positions (default: 10)
-            max_exposure_percent: Maximum exposure per position as % of balance (default: 5%)
+            max_exposure_percent: Maximum total exposure as % of balance (default: 80%)
+            max_volume_impact_percent: Maximum order value as % of 24h volume (default: 1%)
+            position_size_usdt: Position size in USDT (default: 0.1 for testing)
+            leverage: Trading leverage (default: 10)
             signal_max_age_seconds: Maximum signal age before rejection (default: 60s)
         """
         self.db_manager = db_manager
         self.orderbook_manager = orderbook_manager
         self.max_concurrent_positions = max_concurrent_positions
         self.max_exposure_percent = max_exposure_percent
+        self.max_volume_impact_percent = max_volume_impact_percent
+        self.position_size_usdt = position_size_usdt
+        self.leverage = leverage
         self.signal_max_age_seconds = signal_max_age_seconds
         self.logger = get_logger(__name__)
 
@@ -65,6 +74,9 @@ class SignalValidator:
             "signal_validator_initialized",
             max_concurrent_positions=max_concurrent_positions,
             max_exposure_percent=float(max_exposure_percent),
+            max_volume_impact_percent=float(max_volume_impact_percent),
+            position_size_usdt=float(position_size_usdt),
+            leverage=leverage,
             signal_max_age_seconds=signal_max_age_seconds,
         )
 
@@ -234,9 +246,31 @@ class SignalValidator:
             )
             return False, reason
 
-        # 10. Validate balance and exposure
-        # This is a simplified check - actual implementation needs position size calculation
-        # For now, just check minimum balance
+        # 10. Validate total exposure (sum of all positions < 80% of capital)
+        exposure_valid, exposure_reason = await self._validate_total_exposure(
+            signal, account_balance
+        )
+        if not exposure_valid:
+            self.logger.warning(
+                "signal_rejected_exposure_exceeded",
+                symbol=signal.symbol,
+                signal_id=str(signal.id),
+                reason=exposure_reason,
+            )
+            return False, exposure_reason
+
+        # 11. Validate market impact (order size * leverage < 1% of 24h volume)
+        impact_valid, impact_reason = await self._validate_market_impact(signal)
+        if not impact_valid:
+            self.logger.warning(
+                "signal_rejected_market_impact",
+                symbol=signal.symbol,
+                signal_id=str(signal.id),
+                reason=impact_reason,
+            )
+            return False, impact_reason
+
+        # 12. Validate minimum balance
         if account_balance < Decimal(str(MIN_POSITION_SIZE_USDT)):
             reason = f"Insufficient balance ({account_balance} < {MIN_POSITION_SIZE_USDT})"
             self.logger.warning(
@@ -292,24 +326,17 @@ class SignalValidator:
 
     async def _get_open_positions_count(self) -> int:
         """
-        Get number of currently open positions.
-
-        This will query the positions table once it's created in Batch 5.
-        For now, returns 0 as a placeholder.
+        Get number of currently open positions from trades table.
 
         Returns:
             Count of open positions
         """
         try:
-            # TODO: This will be implemented when positions table is created in Batch 5
-            # row = await self.db_manager.fetchrow(
-            #     "SELECT COUNT(*) as count FROM positions WHERE status = $1",
-            #     PositionStatus.OPEN.value
-            # )
-            # return row["count"] if row else 0
-
-            # Placeholder: return 0 until positions table exists
-            return 0
+            row = await self.db_manager.fetchrow(
+                "SELECT COUNT(*) as count FROM trades WHERE status = $1",
+                'open'
+            )
+            return row["count"] if row else 0
         except Exception as e:
             self.logger.error(
                 "failed_to_get_open_positions_count",
@@ -322,9 +349,6 @@ class SignalValidator:
         """
         Check if there's an open position for this symbol.
 
-        This will query the positions table once it's created in Batch 5.
-        For now, returns False as a placeholder.
-
         Args:
             symbol: Trading symbol to check
 
@@ -332,16 +356,12 @@ class SignalValidator:
             True if open position exists for symbol, False otherwise
         """
         try:
-            # TODO: This will be implemented when positions table is created in Batch 5
-            # row = await self.db_manager.fetchrow(
-            #     "SELECT COUNT(*) as count FROM positions WHERE symbol = $1 AND status = $2",
-            #     symbol,
-            #     PositionStatus.OPEN.value
-            # )
-            # return (row["count"] if row else 0) > 0
-
-            # Placeholder: return False until positions table exists
-            return False
+            row = await self.db_manager.fetchrow(
+                "SELECT COUNT(*) as count FROM trades WHERE symbol = $1 AND status = $2",
+                symbol,
+                'open'
+            )
+            return (row["count"] if row else 0) > 0
         except Exception as e:
             self.logger.error(
                 "failed_to_check_open_position",
@@ -373,3 +393,141 @@ class SignalValidator:
                 error=str(e),
             )
             return None
+
+    async def _validate_total_exposure(
+        self, signal: Signal, account_balance: Decimal
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Validate that total exposure doesn't exceed max_exposure_percent of capital.
+
+        Calculates:
+        - Sum of all open positions' value
+        - Adds new position value
+        - Checks against balance * max_exposure_percent
+
+        Args:
+            signal: New signal to validate
+            account_balance: Current account balance
+
+        Returns:
+            Tuple of (is_valid, reason)
+        """
+        try:
+            # Get all open positions from trades table
+            open_trades = await self.db_manager.get_open_trades()
+
+            # Calculate current total exposure
+            current_exposure = Decimal("0")
+            for trade in open_trades:
+                # Exposure = position_size * entry_price
+                position_value = Decimal(str(trade['position_size'])) * Decimal(str(trade['entry_price']))
+                current_exposure += position_value
+
+            # Calculate new position value
+            new_position_value = self.position_size_usdt
+
+            # Total exposure with new position
+            total_exposure = current_exposure + new_position_value
+
+            # Maximum allowed exposure
+            max_allowed = account_balance * (self.max_exposure_percent / Decimal("100"))
+
+            self.logger.debug(
+                "exposure_validation",
+                symbol=signal.symbol,
+                current_exposure=float(current_exposure),
+                new_position_value=float(new_position_value),
+                total_exposure=float(total_exposure),
+                max_allowed=float(max_allowed),
+                account_balance=float(account_balance),
+                max_exposure_percent=float(self.max_exposure_percent),
+            )
+
+            if total_exposure > max_allowed:
+                reason = (
+                    f"Total exposure {total_exposure:.2f} USDT would exceed "
+                    f"{self.max_exposure_percent}% of balance ({max_allowed:.2f} USDT)"
+                )
+                return False, reason
+
+            return True, None
+
+        except Exception as e:
+            self.logger.error(
+                "exposure_validation_error",
+                symbol=signal.symbol,
+                error=str(e),
+                exc_info=True,
+            )
+            # On error, reject to be safe
+            return False, f"Exposure validation error: {str(e)}"
+
+    async def _validate_market_impact(
+        self, signal: Signal
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Validate that order value * leverage doesn't exceed max % of 24h volume.
+
+        This prevents placing orders that could significantly move the market.
+
+        Args:
+            signal: Signal to validate
+
+        Returns:
+            Tuple of (is_valid, reason)
+        """
+        try:
+            # Get 24h volume for symbol from market_stats
+            row = await self.db_manager.fetchrow(
+                "SELECT volume_24h FROM market_stats WHERE symbol = $1",
+                signal.symbol
+            )
+
+            if not row or not row.get('volume_24h'):
+                # If no volume data, allow with warning
+                self.logger.warning(
+                    "market_impact_no_volume_data",
+                    symbol=signal.symbol,
+                    message="No 24h volume data available, skipping market impact check"
+                )
+                return True, None
+
+            volume_24h = Decimal(str(row['volume_24h']))
+
+            # Calculate order value with leverage
+            order_value = self.position_size_usdt * self.leverage
+
+            # Maximum allowed order value
+            max_allowed = volume_24h * (self.max_volume_impact_percent / Decimal("100"))
+
+            self.logger.debug(
+                "market_impact_validation",
+                symbol=signal.symbol,
+                position_size=float(self.position_size_usdt),
+                leverage=self.leverage,
+                order_value=float(order_value),
+                volume_24h=float(volume_24h),
+                max_allowed=float(max_allowed),
+                max_volume_impact_percent=float(self.max_volume_impact_percent),
+            )
+
+            if order_value > max_allowed:
+                impact_percent = (order_value / volume_24h) * Decimal("100")
+                reason = (
+                    f"Order value {order_value:.2f} USDT (with {self.leverage}x leverage) "
+                    f"is {impact_percent:.4f}% of 24h volume ({volume_24h:.0f} USDT), "
+                    f"exceeds max {self.max_volume_impact_percent}%"
+                )
+                return False, reason
+
+            return True, None
+
+        except Exception as e:
+            self.logger.error(
+                "market_impact_validation_error",
+                symbol=signal.symbol,
+                error=str(e),
+                exc_info=True,
+            )
+            # On error, allow but log warning
+            return True, None
