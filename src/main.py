@@ -137,9 +137,8 @@ class TradingBot:
             self.safety_monitor = SafetyMonitor(
                 db_manager=self.db_manager,
                 order_executor=self.order_executor,
-                min_balance_usdt=Decimal("10"),
-                max_total_exposure_percent=Decimal(str(self.config.trading.max_exposure_percent)),
-                max_position_exposure_percent=Decimal(str(self.config.trading.max_exposure_percent)),
+                initial_balance=Decimal("0"),  # Will be set on first check
+                max_loss_percent=Decimal("10"),  # Emergency shutdown at 10% loss
             )
 
             # 6. Subscribe to active symbols

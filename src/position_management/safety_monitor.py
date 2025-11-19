@@ -11,13 +11,9 @@ from datetime import datetime, timedelta
 
 from src.storage.db_manager import DatabaseManager
 from src.trading_execution.order_executor import OrderExecutor
-from src.storage.models import Position, PositionStatus, SystemEvent
+from src.storage.models import SystemEvent
 from src.utils.logger import get_logger
-from src.utils.types import (
-    DEFAULT_MAX_EXPOSURE_PERCENT,
-    EVENT_TYPE_BOT_ERROR,
-    EVENT_SEVERITY_CRITICAL,
-)
+from src.utils.types import EVENT_SEVERITY_CRITICAL
 
 
 class SafetyMonitor:
@@ -43,9 +39,8 @@ class SafetyMonitor:
         self,
         db_manager: DatabaseManager,
         order_executor: OrderExecutor,
-        min_balance_usdt: Decimal = Decimal("10"),
-        max_total_exposure_percent: Decimal = Decimal("50"),
-        max_position_exposure_percent: Decimal = Decimal(str(DEFAULT_MAX_EXPOSURE_PERCENT)),
+        initial_balance: Decimal = Decimal("0"),
+        max_loss_percent: Decimal = Decimal("10"),
     ):
         """
         Initialize safety monitor.
@@ -53,34 +48,32 @@ class SafetyMonitor:
         Args:
             db_manager: Database manager instance
             order_executor: Order executor instance
-            min_balance_usdt: Minimum account balance in USDT (default: 10)
-            max_total_exposure_percent: Maximum total exposure as % of balance (default: 50)
-            max_position_exposure_percent: Maximum per-position exposure as % of balance (default: 5)
+            initial_balance: Starting balance for loss calculation (fetched on startup if 0)
+            max_loss_percent: Maximum allowed loss as % of initial balance (default: 10%)
         """
         self.db_manager = db_manager
         self.order_executor = order_executor
-        self.min_balance_usdt = min_balance_usdt
-        self.max_total_exposure_percent = max_total_exposure_percent
-        self.max_position_exposure_percent = max_position_exposure_percent
+        self.initial_balance = initial_balance
+        self.max_loss_percent = max_loss_percent
         self.logger = get_logger(__name__)
 
         self._emergency_shutdown = False
         self._trading_enabled = True
         self._last_balance_check: Optional[datetime] = None
-        self._last_exposure_check: Optional[datetime] = None
-        self._consecutive_failures = 0
-        self._max_consecutive_failures = 3
 
         self.logger.info(
             "safety_monitor_initialized",
-            min_balance_usdt=float(min_balance_usdt),
-            max_total_exposure_percent=float(max_total_exposure_percent),
-            max_position_exposure_percent=float(max_position_exposure_percent),
+            initial_balance=float(initial_balance),
+            max_loss_percent=float(max_loss_percent),
         )
 
     async def check_safety_conditions(self, balance: Optional[Decimal] = None) -> bool:
         """
         Check all safety conditions.
+
+        Safety checks (in order):
+        1. Capital loss check - triggers emergency if loss > max_loss_percent
+        2. Connection health - technical check only
 
         Args:
             balance: Optional current account balance
@@ -89,21 +82,24 @@ class SafetyMonitor:
             True if all conditions pass, False otherwise
         """
         try:
-            # Check 1: Account balance
-            balance_ok = await self._check_account_balance(balance)
-            if not balance_ok:
-                return False
-
-            # Check 2: Exposure limits
-            # Use the balance for exposure calculations
+            # Fetch balance if not provided
             if balance is None:
                 balance = await self.order_executor.get_account_balance()
 
-            exposure_ok = await self._check_exposure_limits(balance)
-            if not exposure_ok:
+            # Initialize initial_balance on first check
+            if self.initial_balance == Decimal("0"):
+                self.initial_balance = balance
+                self.logger.info(
+                    "initial_balance_set",
+                    initial_balance=float(self.initial_balance),
+                )
+
+            # Check 1: Capital loss (ONLY trigger for emergency shutdown)
+            capital_ok = await self._check_capital_loss(balance)
+            if not capital_ok:
                 return False
 
-            # Check 3: Connection health
+            # Check 2: Connection health (technical check)
             health_ok = await self._check_connection_health()
 
             return health_ok
@@ -112,103 +108,64 @@ class SafetyMonitor:
             self.logger.error("safety_check_error", error=str(e), exc_info=True)
             return False
 
-    async def _check_account_balance(self, balance: Optional[Decimal] = None) -> bool:
+    async def _check_capital_loss(self, balance: Decimal) -> bool:
         """
-        Check if account balance is sufficient.
+        Check if capital loss exceeds maximum allowed percentage.
+
+        This is the ONLY condition that triggers emergency shutdown.
 
         Args:
-            balance: Current account balance (if None, fetches from executor)
+            balance: Current account balance
 
         Returns:
-            True if balance is sufficient, False otherwise
+            True if within acceptable loss, False if emergency triggered
         """
         try:
-            # Use provided balance or fetch from executor
-            if balance is None:
-                balance = await self.order_executor.get_account_balance()
-
             self._last_balance_check = datetime.now()
 
-            if balance < self.min_balance_usdt:
+            if self.initial_balance <= Decimal("0"):
+                self.logger.warning("initial_balance_not_set")
+                return True
+
+            # Calculate loss percentage
+            if balance >= self.initial_balance:
+                loss_percent = Decimal("0")
+            else:
+                loss_percent = ((self.initial_balance - balance) / self.initial_balance) * Decimal("100")
+
+            self.logger.debug(
+                "capital_loss_check",
+                current_balance=float(balance),
+                initial_balance=float(self.initial_balance),
+                loss_percent=float(loss_percent),
+                max_loss_percent=float(self.max_loss_percent),
+            )
+
+            if loss_percent >= self.max_loss_percent:
                 self.logger.critical(
-                    "balance_below_minimum",
-                    balance=float(balance),
-                    minimum=float(self.min_balance_usdt),
+                    "capital_loss_exceeded",
+                    current_balance=float(balance),
+                    initial_balance=float(self.initial_balance),
+                    loss_percent=float(loss_percent),
+                    max_loss_percent=float(self.max_loss_percent),
                 )
 
                 # Log critical event
                 await self._log_critical_event(
-                    "LOW_BALANCE",
-                    f"Balance {balance} below minimum {self.min_balance_usdt}"
+                    "CAPITAL_LOSS_EXCEEDED",
+                    f"Loss {loss_percent:.2f}% exceeds maximum {self.max_loss_percent}%. "
+                    f"Initial: {self.initial_balance} USDT, Current: {balance} USDT"
                 )
 
                 # Trigger emergency shutdown
                 await self.emergency_shutdown()
                 return False
 
-            self.logger.debug(
-                "balance_check_passed",
-                balance=float(balance),
-                minimum=float(self.min_balance_usdt),
-            )
             return True
 
         except Exception as e:
-            self.logger.error("balance_check_error", error=str(e), exc_info=True)
-            return False
-
-    async def _check_exposure_limits(self, balance: Decimal) -> bool:
-        """
-        Check if exposure limits are within acceptable range.
-
-        Args:
-            balance: Current account balance
-
-        Returns:
-            True if within limits, False otherwise
-        """
-        try:
-            # Calculate total exposure from open positions
-            # In production, this would query open positions:
-            # positions = await self._get_open_positions()
-            # total_exposure = sum(pos.size * pos.entry_price for pos in positions)
-            total_exposure = Decimal("0")
-
-            self._last_exposure_check = datetime.now()
-
-            # Calculate exposure percentage
-            exposure_percent = (total_exposure / balance * Decimal("100")) if balance > 0 else Decimal("0")
-
-            if exposure_percent > self.max_total_exposure_percent:
-                self.logger.critical(
-                    "total_exposure_exceeded",
-                    exposure_percent=float(exposure_percent),
-                    max_percent=float(self.max_total_exposure_percent),
-                    total_exposure=float(total_exposure),
-                    balance=float(balance),
-                )
-
-                await self._log_critical_event(
-                    "EXPOSURE_LIMIT_EXCEEDED",
-                    f"Total exposure {exposure_percent}% exceeds limit {self.max_total_exposure_percent}%"
-                )
-
-                # TODO: Implement position reduction logic
-                # await self._reduce_exposure(positions, balance)
-                return False
-
-            self.logger.debug(
-                "exposure_check_passed",
-                exposure_percent=float(exposure_percent),
-                max_percent=float(self.max_total_exposure_percent),
-                total_exposure=float(total_exposure),
-                balance=float(balance),
-            )
-            return True
-
-        except Exception as e:
-            self.logger.error("exposure_check_error", error=str(e), exc_info=True)
-            return False
+            self.logger.error("capital_loss_check_error", error=str(e), exc_info=True)
+            return True  # Don't trigger emergency on check error
 
     async def _check_connection_health(self) -> bool:
         """
@@ -251,17 +208,16 @@ class SafetyMonitor:
 
     async def emergency_shutdown(self) -> None:
         """
-        Execute emergency shutdown procedures.
+        Execute emergency shutdown procedures with forced position closing.
 
         Emergency shutdown sequence:
         1. Set emergency_shutdown flag
         2. Disable trading
         3. Log critical event
-        4. TODO: Close all open positions
-        5. TODO: Alert operator
+        4. CLOSE ALL OPEN POSITIONS (forced market orders)
+        5. Verify all positions closed
 
-        CRITICAL: This is a last-resort safety measure.
-        Manual intervention may be required.
+        CRITICAL: This closes ALL positions immediately with market orders.
         """
         if self._emergency_shutdown:
             self.logger.warning("emergency_shutdown_already_active")
@@ -276,19 +232,85 @@ class SafetyMonitor:
             # Log critical event
             await self._log_critical_event(
                 "EMERGENCY_SHUTDOWN",
-                "Emergency shutdown initiated - all trading stopped"
+                "Emergency shutdown initiated - closing all positions"
             )
 
-            # TODO: Close all open positions
-            # In production, this would:
-            # 1. Get all open positions from exchange
-            # 2. Close each position with market orders
-            # 3. Verify all positions are closed
-            # 4. Send alert to operator
+            # CRITICAL: Close ALL open positions
+            closed_count = 0
+            failed_count = 0
+
+            # Fetch all open positions from exchange
+            try:
+                exchange_positions = await self.order_executor.fetch_open_positions_from_exchange()
+
+                self.logger.critical(
+                    "emergency_closing_positions",
+                    position_count=len(exchange_positions),
+                )
+
+                for pos_data in exchange_positions:
+                    symbol = pos_data.get('symbol', '')
+                    size = Decimal(str(pos_data.get('size', '0')))
+                    side = pos_data.get('side', '')  # 'Buy' or 'Sell'
+
+                    if size <= 0:
+                        continue
+
+                    # Determine close side (opposite of position side)
+                    close_side = "Sell" if side == "Buy" else "Buy"
+
+                    try:
+                        success = await self.order_executor.close_position(
+                            symbol=symbol,
+                            qty=size,
+                            side=close_side
+                        )
+
+                        if success:
+                            closed_count += 1
+                            self.logger.critical(
+                                "emergency_position_closed",
+                                symbol=symbol,
+                                size=float(size),
+                                side=close_side,
+                            )
+                        else:
+                            failed_count += 1
+                            self.logger.critical(
+                                "emergency_position_close_failed",
+                                symbol=symbol,
+                                size=float(size),
+                                side=close_side,
+                            )
+
+                    except Exception as e:
+                        failed_count += 1
+                        self.logger.critical(
+                            "emergency_position_close_error",
+                            symbol=symbol,
+                            error=str(e),
+                            exc_info=True,
+                        )
+
+                # Log final results
+                await self._log_critical_event(
+                    "EMERGENCY_POSITIONS_CLOSED",
+                    f"Closed {closed_count} positions, failed {failed_count}"
+                )
+
+            except Exception as e:
+                self.logger.critical(
+                    "emergency_fetch_positions_failed",
+                    error=str(e),
+                    exc_info=True,
+                    message="MANUAL INTERVENTION REQUIRED - Could not fetch positions"
+                )
 
             self.logger.critical(
                 "emergency_shutdown_complete",
-                message="All trading stopped. Manual intervention may be required."
+                closed_positions=closed_count,
+                failed_positions=failed_count,
+                message="All trading stopped. Manual verification recommended."
             )
 
         except Exception as e:
@@ -336,7 +358,6 @@ class SafetyMonitor:
             return
 
         self._trading_enabled = True
-        self._consecutive_failures = 0
 
         self.logger.info("trading_enabled")
 
@@ -399,10 +420,7 @@ class SafetyMonitor:
         return {
             "trading_enabled": self._trading_enabled,
             "emergency_shutdown": self._emergency_shutdown,
-            "consecutive_failures": self._consecutive_failures,
             "last_balance_check": self._last_balance_check.isoformat() if self._last_balance_check else None,
-            "last_exposure_check": self._last_exposure_check.isoformat() if self._last_exposure_check else None,
-            "min_balance_usdt": float(self.min_balance_usdt),
-            "max_total_exposure_percent": float(self.max_total_exposure_percent),
-            "max_position_exposure_percent": float(self.max_position_exposure_percent),
+            "initial_balance": float(self.initial_balance),
+            "max_loss_percent": float(self.max_loss_percent),
         }
